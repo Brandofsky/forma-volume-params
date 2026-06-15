@@ -23,20 +23,26 @@ export function saveElementData(path, data) {
 async function readFormaElement(path) {
   try {
     const result = await Forma.areaMetrics.calculate({ paths: [path] });
-    const m = result?.builtInMetrics || result?.buildInMetrics || {};
+    console.log("[Forma] areaMetrics raw:", path, JSON.stringify(result));
 
-    // GFA comes back in m² from Forma — convert to SF
-    const gfaM2     = m.gfa        ?? m.grossFloorArea ?? 0;
-    const gfaSF     = Math.round(gfaM2 * 10.764);
-    const floors    = m.floorCount  ?? m.floors         ?? 1;
-    const heightM   = m.buildingHeight ?? m.height      ?? 0;
-    const heightFt  = Math.round(heightM * 3.281);
-    // Footprint = GFA / floors (per floor area)
+    // API response shape varies across SDK versions — try all known structures
+    const m = result?.builtInMetrics
+           || result?.metrics
+           || (Array.isArray(result) ? result[0]?.builtInMetrics || result[0]?.metrics : null)
+           || {};
+
+    // GFA comes back in m² — try all known key names, then convert to SF
+    const gfaM2      = m.grossFloorArea ?? m.gfa ?? m.gross_floor_area ?? 0;
+    const gfaSF      = Math.round(gfaM2 * 10.764);
+    const floors     = m.floorCount ?? m.floors ?? m.numberOfFloors ?? m.number_of_floors ?? 1;
+    const heightM    = m.buildingHeight ?? m.height ?? m.building_height ?? 0;
+    const heightFt   = Math.round(heightM * 3.281);
     const footprintSF = floors > 0 ? Math.round(gfaSF / floors) : gfaSF;
 
+    console.log("[Forma] parsed:", { path, gfaSF, floors, heightFt });
     return { path, gfaSF, floors, heightFt, footprintSF };
   } catch (err) {
-    console.warn("areaMetrics failed for", path, err);
+    console.warn("[Forma] areaMetrics failed for", path, err);
     return { path, gfaSF: 0, floors: 1, heightFt: 0, footprintSF: 0 };
   }
 }
