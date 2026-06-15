@@ -67,9 +67,9 @@ export default function ParameterPanel({ volume, parseName, readParams, savePara
     try {
       await saveParams(volume.path, form);
       setSaved(true);
-      showToast("Saved to element ✓");
-    } catch {
-      showToast("Save failed — check console");
+      showToast("Saved ✓");
+    } catch (err) {
+      showToast("Save failed: " + err.message);
     }
   }
 
