@@ -54,23 +54,22 @@ export default function App() {
     loadVolumes();
   }, []);
 
-  // ── Read saved params from Forma element properties ────────────────────────
-  async function readParams(path) {
-    try {
-      const props = await Forma.properties.get({ path });
-      return props?.volumeParams || null;
-    } catch {
-      return null;
-    }
+// Read saved params from localStorage (keyed by volume path)
+async function readParams(path) {
+  try {
+    const key = `forma-params:${path}`;
+    const stored = localStorage.getItem(key);
+    return stored ? JSON.parse(stored) : null;
+  } catch {
+    return null;
   }
+}
 
-  // ── Write params back to Forma element properties ──────────────────────────
-  async function saveParams(path, params) {
-    await Forma.properties.set({
-      path,
-      properties: { volumeParams: params },
-    });
-  }
+// Write params to localStorage
+async function saveParams(path, params) {
+  const key = `forma-params:${path}`;
+  localStorage.setItem(key, JSON.stringify(params));
+}
 
   if (loading) return <div style={styles.status}>Loading volumes…</div>;
   if (error)   return <div style={styles.status}>Error: {error}</div>;
