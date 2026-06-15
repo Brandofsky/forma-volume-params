@@ -37,35 +37,54 @@ export default function App() {
   const [allData, setAllData]     = useState(loadAllData());
   const [loading, setLoading]     = useState(true);
 
-  // ── Load elements from Forma (with mock fallback) ──────────────────────────
-  useEffect(() => {
-    async function load() {
-      try {
-        const paths = await Forma.elements.getPathsInGroundPlane();
-        const els = await Promise.all(
-          paths.map(async (path) => {
-            try {
-              const props = await Forma.elements.getPropertiesByPath({ path });
-              return {
-                path,
-                name: props?.label || path.split("/").pop(),
-                floors: props?.floorCount || props?.floors || 1,
-              };
-            } catch {
-              return { path, name: path.split("/").pop(), floors: 1 };
-            }
-          })
-        );
-        setElements(els.filter(Boolean));
-      } catch {
-        // Outside Forma — use mock data
-        setElements(MOCK_ELEMENTS);
-      } finally {
-        setLoading(false);
-      }
+// ── Reactively load elements whenever the proposal changes ─────────────────
+useEffect(() => {
+  async function loadElements() {
+    try {
+      const paths = await Forma.elements.getPathsInGroundPlane();
+      const els = await Promise.all(
+        paths.map(async (path) => {
+          try {
+            const props = await Forma.elements.getPropertiesByPath({ path });
+            return {
+              path,
+              name:   props?.label || path.split("/").pop(),
+              floors: props?.floorCount || props?.floors || 1,
+            };
+          } catch {
+            return { path, name: path.split("/").pop(), floors: 1 };
+          }
+        })
+      );
+      setElements(els.filter(Boolean));
+    } catch {
+      // Outside Forma — use mock data, no subscription needed
+      setElements(MOCK_ELEMENTS);
+    } finally {
+      setLoading(false);
     }
-    load();
-  }, []);
+  }
+
+  // Load immediately on mount
+  loadElements();
+
+  // ← THE FIX: subscribe to proposal changes → reload elements on every change
+  let unsubscribe;
+  try {
+    unsubscribe = Forma.proposal.subscribe(() => {
+      loadElements();
+    });
+  } catch {
+    // Outside Forma — polling fallback every 3 seconds for dev
+    const interval = setInterval(loadElements, 3000);
+    unsubscribe = () => clearInterval(interval);
+  }
+
+  // Cleanup on unmount
+  return () => {
+    if (typeof unsubscribe === "function") unsubscribe();
+  };
+}, []);
 
   // Refresh allData from localStorage whenever tab changes
   useEffect(() => {
