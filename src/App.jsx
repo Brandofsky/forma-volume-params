@@ -18,47 +18,35 @@ export function saveElementData(path, data) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
 }
 
-// ─── Shoelace formula: area of a 2D ring (coords in meters) ──────────────────
-function shoelaceArea(ring) {
-  let area = 0;
-  for (let i = 0, n = ring.length; i < n; i++) {
-    const [x1, y1] = ring[i];
-    const [x2, y2] = ring[(i + 1) % n];
-    area += x1 * y2 - x2 * y1;
-  }
-  return Math.abs(area) / 2;
-}
-
 // ─── Read REAL properties from a Forma building path ─────────────────────────
-// grossFloorAreaPolygons: one polygon per floor (local coords, meters)
-// graphBuilding.levels: per-floor heights → sum = building height
+// areaMetrics.calculate returns:
+//   builtInMetrics.grossFloorArea.value   → total GFA in m²
+//   builtInMetrics.buildingCoverage.value → footprint area in m²
+// floor count is derived as round(GFA / footprint)
 async function readFormaElement(path) {
   try {
-    const urn = path;
+    const result = await Forma.areaMetrics.calculate({ paths: [path] });
+    const bim = result?.builtInMetrics ?? {};
 
-    // One GrossFloorAreaPolygon per floor → floor count + total GFA
-    const gfaResult = await Forma.elements.representations.grossFloorAreaPolygons({ urn });
-    const polygons  = gfaResult?.data ?? [];
-    const floors    = Math.max(polygons.length, 1);
+    const gfaM2       = typeof bim.grossFloorArea?.value    === "number" ? bim.grossFloorArea.value    : 0;
+    const coverageM2  = typeof bim.buildingCoverage?.value  === "number" ? bim.buildingCoverage.value  : 0;
 
-    let gfaM2 = 0;
-    for (const p of polygons) {
-      const rings = p.grossFloorPolygon ?? [];
-      if (!rings.length) continue;
-      const outer = shoelaceArea(rings[0]);
-      const holes  = rings.slice(1).reduce((h, r) => h + shoelaceArea(r), 0);
-      gfaM2 += outer - holes;
-    }
-    const gfaSF      = Math.round(gfaM2 * 10.764);
-    const footprintSF = floors > 0 ? Math.round(gfaSF / floors) : gfaSF;
+    const gfaSF       = Math.round(gfaM2      * 10.764);
+    const footprintSF = Math.round(coverageM2  * 10.764);
 
-    // Sum level heights for total building height
+    // Each floor ≈ footprint area → floor count = GFA / footprint
+    const floors = coverageM2 > 0 ? Math.max(1, Math.round(gfaM2 / coverageM2)) : 1;
+
+    // Try graphBuilding for precise height; fall back to floors × 3 m (≈10 ft)
     let heightFt = 0;
     try {
+      const urn    = path.split("/").filter(Boolean).pop() || path;
       const graph  = await Forma.elements.representations.graphBuilding({ urn });
       const totalM = (graph?.data?.levels ?? []).reduce((s, l) => s + (l.height ?? 0), 0);
-      heightFt     = Math.round(totalM * 3.281);
-    } catch { /* graphBuilding not available for all building types */ }
+      heightFt     = totalM > 0 ? Math.round(totalM * 3.281) : Math.round(floors * 3 * 3.281);
+    } catch {
+      heightFt = Math.round(floors * 3 * 3.281);
+    }
 
     return { path, gfaSF, floors, heightFt, footprintSF };
   } catch (err) {
@@ -103,11 +91,9 @@ export default function App() {
           return;
         }
         setStatus("Loading building data…");
-        // Read real Forma data for the clicked element
         const el = await readFormaElement(paths[0]);
         setSelected(el);
         setStatus(null);
-        // Switch to Assign tab automatically
         setActiveTab("Assign");
       });
     } catch {
@@ -127,13 +113,11 @@ export default function App() {
     let unsubProposal;
     try {
       unsubProposal = Forma.proposal.subscribe(async () => {
-        // Proposal changed — reload all buildings AND re-read selected if any
         await reloadAllBuildings();
         setSelected((prev) => {
           if (!prev) return prev;
-          // Re-read the currently selected building with fresh data
           readFormaElement(prev.path).then(setSelected);
-          return prev; // return current while async runs
+          return prev;
         });
       });
     } catch {
