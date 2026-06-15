@@ -18,31 +18,51 @@ export function saveElementData(path, data) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
 }
 
+// ─── Shoelace formula: area of a 2D ring (coords in meters) ──────────────────
+function shoelaceArea(ring) {
+  let area = 0;
+  for (let i = 0, n = ring.length; i < n; i++) {
+    const [x1, y1] = ring[i];
+    const [x2, y2] = ring[(i + 1) % n];
+    area += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(area) / 2;
+}
+
 // ─── Read REAL properties from a Forma building path ─────────────────────────
-// Uses areaMetrics.calculate which returns gfa, floors, height live from Forma
+// grossFloorAreaPolygons: one polygon per floor (local coords, meters)
+// graphBuilding.levels: per-floor heights → sum = building height
 async function readFormaElement(path) {
   try {
-    const result = await Forma.areaMetrics.calculate({ paths: [path] });
-    console.log("[Forma] areaMetrics raw:", path, JSON.stringify(result));
+    const urn = path;
 
-    // API response shape varies across SDK versions — try all known structures
-    const m = result?.builtInMetrics
-           || result?.metrics
-           || (Array.isArray(result) ? result[0]?.builtInMetrics || result[0]?.metrics : null)
-           || {};
+    // One GrossFloorAreaPolygon per floor → floor count + total GFA
+    const gfaResult = await Forma.elements.representations.grossFloorAreaPolygons({ urn });
+    const polygons  = gfaResult?.data ?? [];
+    const floors    = Math.max(polygons.length, 1);
 
-    // GFA comes back in m² — try all known key names, then convert to SF
-    const gfaM2      = m.grossFloorArea ?? m.gfa ?? m.gross_floor_area ?? 0;
+    let gfaM2 = 0;
+    for (const p of polygons) {
+      const rings = p.grossFloorPolygon ?? [];
+      if (!rings.length) continue;
+      const outer = shoelaceArea(rings[0]);
+      const holes  = rings.slice(1).reduce((h, r) => h + shoelaceArea(r), 0);
+      gfaM2 += outer - holes;
+    }
     const gfaSF      = Math.round(gfaM2 * 10.764);
-    const floors     = m.floorCount ?? m.floors ?? m.numberOfFloors ?? m.number_of_floors ?? 1;
-    const heightM    = m.buildingHeight ?? m.height ?? m.building_height ?? 0;
-    const heightFt   = Math.round(heightM * 3.281);
     const footprintSF = floors > 0 ? Math.round(gfaSF / floors) : gfaSF;
 
-    console.log("[Forma] parsed:", { path, gfaSF, floors, heightFt });
+    // Sum level heights for total building height
+    let heightFt = 0;
+    try {
+      const graph  = await Forma.elements.representations.graphBuilding({ urn });
+      const totalM = (graph?.data?.levels ?? []).reduce((s, l) => s + (l.height ?? 0), 0);
+      heightFt     = Math.round(totalM * 3.281);
+    } catch { /* graphBuilding not available for all building types */ }
+
     return { path, gfaSF, floors, heightFt, footprintSF };
   } catch (err) {
-    console.warn("[Forma] areaMetrics failed for", path, err);
+    console.warn("[Forma] readFormaElement failed for", path, err);
     return { path, gfaSF: 0, floors: 1, heightFt: 0, footprintSF: 0 };
   }
 }
