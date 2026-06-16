@@ -25,29 +25,54 @@ export function saveElementData(path, data) {
 // floor count is derived as round(GFA / footprint)
 async function readFormaElement(path) {
   try {
-    const result = await Forma.areaMetrics.calculate({ paths: [path] });
-    const bim = result?.builtInMetrics ?? {};
-
-    const gfaM2       = typeof bim.grossFloorArea?.value    === "number" ? bim.grossFloorArea.value    : 0;
-    const coverageM2  = typeof bim.buildingCoverage?.value  === "number" ? bim.buildingCoverage.value  : 0;
-
-    const gfaSF       = Math.round(gfaM2      * 10.764);
-    const footprintSF = Math.round(coverageM2  * 10.764);
-
-    // Each floor ≈ footprint area → floor count = GFA / footprint
-    const floors = coverageM2 > 0 ? Math.max(1, Math.round(gfaM2 / coverageM2)) : 1;
-
-    // Try graphBuilding for precise height; fall back to floors × 3 m (≈10 ft)
+    // ── Step 1: graphBuilding is the authoritative source for floors + height ──
+    let floors = 1;
     let heightFt = 0;
     try {
-      const urn    = path.split("/").filter(Boolean).pop() || path;
-      const graph  = await Forma.elements.representations.graphBuilding({ urn });
-      const totalM = (graph?.data?.levels ?? []).reduce((s, l) => s + (l.height ?? 0), 0);
-      heightFt     = totalM > 0 ? Math.round(totalM * 3.281) : Math.round(floors * 3 * 3.281);
+      const urn   = path.split("/").filter(Boolean).pop() || path;
+      const graph = await Forma.elements.representations.graphBuilding({ urn });
+      const levels = graph?.data?.levels ?? [];
+
+      if (levels.length > 0) {
+        floors   = levels.length;                                        // ← exact floor count
+        const totalM = levels.reduce((s, l) => s + (l.height ?? 0), 0);
+        heightFt = totalM > 0 ? Math.round(totalM * 3.281) : floors * 10; // 10 ft default per floor
+      }
     } catch {
-      heightFt = Math.round(floors * 3 * 3.281);
+      // graphBuilding unavailable — will fall back below
     }
 
+    // ── Step 2: areaMetrics for GFA + footprint ───────────────────────────────
+    let gfaSF       = 0;
+    let footprintSF = 0;
+    try {
+      const result  = await Forma.areaMetrics.calculate({ paths: [path] });
+      const bim     = result?.builtInMetrics ?? {};
+      const gfaM2   = typeof bim.grossFloorArea?.value   === "number" ? bim.grossFloorArea.value   : 0;
+      const covM2   = typeof bim.buildingCoverage?.value === "number" ? bim.buildingCoverage.value : 0;
+
+      gfaSF       = Math.round(gfaM2 * 10.764);
+      footprintSF = Math.round(covM2  * 10.764);
+
+      // If graphBuilding gave us 0 floors (failed), fall back to GFA/coverage ratio
+      if (floors === 1 && covM2 > 0 && gfaM2 > 0) {
+        floors   = Math.max(1, Math.round(gfaM2 / covM2));
+        heightFt = heightFt || Math.round(floors * 3 * 3.281);
+      }
+    } catch {
+      // areaMetrics unavailable — GFA stays 0
+    }
+
+    // Final height fallback
+    if (heightFt === 0) heightFt = Math.round(floors * 10); // 10 ft per floor
+
+    return { path, gfaSF, floors, heightFt, footprintSF };
+
+  } catch (err) {
+    console.warn("[Forma] readFormaElement failed for", path, err);
+    return { path, gfaSF: 0, floors: 1, heightFt: 0, footprintSF: 0 };
+  }
+}
     return { path, gfaSF, floors, heightFt, footprintSF };
   } catch (err) {
     console.warn("[Forma] readFormaElement failed for", path, err);
