@@ -73,12 +73,6 @@ async function readFormaElement(path) {
     return { path, gfaSF: 0, floors: 1, heightFt: 0, footprintSF: 0 };
   }
 }
-    return { path, gfaSF, floors, heightFt, footprintSF };
-  } catch (err) {
-    console.warn("[Forma] readFormaElement failed for", path, err);
-    return { path, gfaSF: 0, floors: 1, heightFt: 0, footprintSF: 0 };
-  }
-}
 
 const TABS = ["Assign", "Matrix", "Visualize", "Report"];
 
