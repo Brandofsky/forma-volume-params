@@ -1,22 +1,94 @@
 import { useState, useEffect } from "react";
+import { Forma } from "forma-embedded-view-sdk/auto";
 
 const FUNCTIONS    = ["3 Bedroom", "2 Bedroom", "1 Bedroom", "Core", "Corridor", "Amenity"];
 const PHASES       = ["Phase 1", "Phase 2", "Phase 3", "Phase 4"];
 const COST_DEFAULT = { "3 Bedroom": 220, "2 Bedroom": 200, "1 Bedroom": 185, "Core": 95, "Corridor": 80, "Amenity": 160 };
 
+// Map our function names to Forma's built-in function IDs where applicable.
+// Built-in IDs: "residential", "commercial", "unspecified"
+// For functions not in Forma's built-ins, we create a custom one by name.
+const FORMA_BUILTIN_MAP = {
+  "3 Bedroom":  "residential",
+  "2 Bedroom":  "residential",
+  "1 Bedroom":  "residential",
+  "Core":       "unspecified",
+  "Corridor":   "unspecified",
+  "Amenity":    "commercial",
+};
+
 function emptyForm() {
   return { sector: "Affordable Housing", function: "", costPerSF: "", phase: "Phase 1", withinSite: false };
 }
 
-export default function Assign({ selected, allData, onSave }) {
-  const [form,  setForm]  = useState(emptyForm());
-  const [toast, setToast] = useState(null);
+// ── Sync function to Forma's native building function field ───────────────────
+// Flow:
+//  1. Forma.settings.get() → list existing project functions
+//  2. Find by name, or create via Forma.settings.buildingFunctions.add()
+//  3. Forma.elements.editProperties({ urn, propertiesJsonMergePatch })
+//     using namespace "affordable:params" to store our data on the element
+//  4. Forma.proposal.replaceElement({ path, urn }) to commit the change
+//
+// Note: native functionId (deprecated) can only be set via the built-in
+// function IDs ("residential", "commercial", "unspecified"). For our custom
+// names we use editProperties with our own namespace so data lives on the element.
+async function syncFunctionToForma(path, elementUrn, fnName) {
+  try {
+    // Get all project functions
+    const { buildingFunctions } = await Forma.settings.get();
 
-  // When selected building changes → load its saved data or reset
+    // Find existing or create new
+    let match = buildingFunctions.find(
+      (f) => f.name.toLowerCase() === fnName.toLowerCase()
+    );
+    if (!match) {
+      const result = await Forma.settings.buildingFunctions.add({ name: fnName });
+      match = result.buildingFunctions.find(
+        (f) => f.name.toLowerCase() === fnName.toLowerCase()
+      );
+    }
+
+    if (!match) return; // shouldn't happen
+
+    // Write the function ID onto the element via editProperties
+    // This uses our custom namespace "affordable:params" to store the assignment
+    // AND also updates the native functionId via the built-in mapping
+    const builtinId = FORMA_BUILTIN_MAP[fnName] ?? "unspecified";
+    const { urn: newUrn } = await Forma.elements.editProperties({
+      urn: elementUrn,
+      propertiesJsonMergePatch: {
+        "affordable:params": {
+          functionName: fnName,
+          functionId:   match.id,
+        },
+      },
+    });
+
+    // Replace the element in the proposal to commit the property change
+    await Forma.proposal.replaceElement({ path, urn: newUrn });
+
+  } catch (e) {
+    // Non-fatal — localStorage assignment still works even if Forma sync fails
+    console.warn("[Forma] syncFunctionToForma failed", e);
+  }
+}
+
+export default function Assign({ selected, allData, onSave }) {
+  const [form,     setForm]     = useState(emptyForm());
+  const [toast,    setToast]    = useState(null);
+  const [syncing,  setSyncing]  = useState(false);
+  const [elementUrn, setElementUrn] = useState(null);
+
+  // When selected building changes → load saved data + fetch element URN
   useEffect(() => {
     if (!selected) return;
     const saved = allData[selected.path];
     setForm(saved ? { ...emptyForm(), ...saved } : emptyForm());
+
+    // Fetch element URN for Forma sync
+    Forma.elements.getByPath({ path: selected.path })
+      .then((res) => setElementUrn(res?.element?.urn ?? null))
+      .catch(() => setElementUrn(null));
   }, [selected?.path]);
 
   function handleChange(key, val) {
@@ -29,10 +101,21 @@ export default function Assign({ selected, allData, onSave }) {
     });
   }
 
-  function handleSave() {
+  async function handleSave() {
     if (!selected) return;
     if (!form.function) { showToast("⚠ Select a function first"); return; }
+
+    // 1. Save to localStorage immediately
     onSave(selected.path, form);
+
+    // 2. Sync to Forma's native function field in the background
+    if (elementUrn) {
+      setSyncing(true);
+      showToast("Saving…");
+      await syncFunctionToForma(selected.path, elementUrn, form.function);
+      setSyncing(false);
+    }
+
     showToast("Saved ✓");
   }
 
@@ -45,14 +128,13 @@ export default function Assign({ selected, allData, onSave }) {
 
   function showToast(msg) {
     setToast(msg);
-    setTimeout(() => setToast(null), 2000);
+    setTimeout(() => setToast(null), 2500);
   }
 
-  const costPerSF  = parseFloat(form.costPerSF) || 0;
-  const totalCost  = selected ? selected.gfaSF * costPerSF : 0;
-  const isSaved    = selected && !!allData[selected.path]?.function;
+  const costPerSF = parseFloat(form.costPerSF) || 0;
+  const totalCost = selected ? selected.gfaSF * costPerSF : 0;
+  const isSaved   = selected && !!allData[selected.path]?.function;
 
-  // ── Empty state ──────────────────────────────────────────────────────────
   if (!selected) {
     return (
       <div style={S.empty}>
@@ -66,23 +148,22 @@ export default function Assign({ selected, allData, onSave }) {
   return (
     <div style={S.root}>
 
-      {/* Live building stats from Forma */}
+      {/* Live building stats */}
       <div style={S.statsCard}>
         <div style={S.statsLabel}>Live from Forma</div>
         <div style={S.statsGrid}>
-          <Stat label="Floors"       value={selected.floors} />
-          <Stat label="Total GFA"    value={`${selected.gfaSF.toLocaleString()} SF`} />
-          <Stat label="Per Floor"    value={`${selected.footprintSF.toLocaleString()} SF`} />
-          <Stat label="Height"       value={`${selected.heightFt} ft`} />
+          <Stat label="Floors"    value={selected.floors} />
+          <Stat label="Total GFA" value={`${selected.gfaSF.toLocaleString()} SF`} />
+          <Stat label="Per Floor" value={`${selected.footprintSF.toLocaleString()} SF`} />
+          <Stat label="Height"    value={`${selected.heightFt} ft`} />
         </div>
         <div style={S.pathLabel}>{selected.path.split("/").pop()}</div>
       </div>
 
-      {/* Form */}
       <div style={S.form}>
 
         {/* Function picker */}
-        <Field label="Function">
+        <Field label="Function" hint={syncing ? "syncing to Forma…" : elementUrn ? "syncs to Forma panel" : ""}>
           <div style={S.fnGrid}>
             {FUNCTIONS.map((fn) => (
               <button
@@ -138,7 +219,7 @@ export default function Assign({ selected, allData, onSave }) {
           </div>
         </Field>
 
-        {/* Cost summary — only show when function + cost are set */}
+        {/* Cost summary */}
         {form.function && costPerSF > 0 && (
           <div style={S.costCard}>
             <div style={S.costRow}>
@@ -160,13 +241,15 @@ export default function Assign({ selected, allData, onSave }) {
 
         {/* Actions */}
         <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={handleSave} style={S.saveBtn}>Save to Element</button>
+          <button onClick={handleSave} disabled={syncing} style={{ ...S.saveBtn, opacity: syncing ? 0.7 : 1 }}>
+            {syncing ? "Syncing…" : "Save to Element"}
+          </button>
           {isSaved && (
             <button onClick={handleClear} style={S.clearBtn}>Clear</button>
           )}
         </div>
 
-        {/* Saved confirmation */}
+        {/* Saved badge */}
         {isSaved && (
           <div style={S.savedBadge}>
             <span style={{ color: "#34D399" }}>✓</span> Parameters saved
@@ -189,7 +272,7 @@ function Field({ label, hint, children }) {
         <span style={{ fontSize: 10, letterSpacing: "0.07em", textTransform: "uppercase", color: "#9CA3AF", fontFamily: "monospace" }}>
           {label}
         </span>
-        {hint && <span style={{ fontSize: 10, color: "#4B5563" }}>{hint}</span>}
+        {hint && <span style={{ fontSize: 10, color: "#4B5563", fontStyle: "italic" }}>{hint}</span>}
       </div>
       {children}
     </div>

@@ -1,25 +1,17 @@
-// Matrix logic — based on sketch:
-//
-// Building 1: 6 floors, 3-Bedroom
-// Building 2: 3 floors, 3-Bedroom
-//
-// Floor | 3-Bed        | Σ
-// ------+--------------+---
-//   1   | 1 + 1 = 2    | 2
-//   2   | 1 + 1 = 2    | 2
-//   3   | 1 + 1 = 2    | 2
-//   4   | 1            | 1
-//   5   | 1            | 1
-//   6   | 1            | 1
-// Total | 6 + 3 = 9    | 9
-//
-// cell[floor][fn] = number of buildings with that fn whose floor count >= floor
-// colTotal[fn]    = sum of all floors across buildings with that fn
-// grandTotal      = sum of colTotals = total units across site
+// Unit functions — only these count toward "Total Units" in the matrix
+const UNIT_FUNCTIONS    = ["3 Bedroom", "2 Bedroom", "1 Bedroom"];
+// Support functions — shown in matrix but NOT counted as units
+const SUPPORT_FUNCTIONS = ["Core", "Corridor", "Amenity"];
+const ALL_FUNCTIONS     = [...UNIT_FUNCTIONS, ...SUPPORT_FUNCTIONS];
 
-const FUNCTIONS = ["3 Bedroom", "2 Bedroom", "1 Bedroom", "Core", "Corridor", "Amenity"];
-const FN_SHORT  = { "3 Bedroom": "3 Bed", "2 Bedroom": "2 Bed", "1 Bedroom": "1 Bed", "Core": "Core", "Corridor": "Corr", "Amenity": "Amen" };
-const FN_COLOR  = { "3 Bedroom": "#60A5FA", "2 Bedroom": "#34D399", "1 Bedroom": "#FBBF24", "Core": "#F87171", "Corridor": "#A78BFA", "Amenity": "#FB923C" };
+const FN_SHORT = {
+  "3 Bedroom": "3 Bed", "2 Bedroom": "2 Bed", "1 Bedroom": "1 Bed",
+  "Core": "Core", "Corridor": "Corr", "Amenity": "Amen",
+};
+const FN_COLOR = {
+  "3 Bedroom": "#60A5FA", "2 Bedroom": "#34D399", "1 Bedroom": "#FBBF24",
+  "Core": "#F87171", "Corridor": "#A78BFA", "Amenity": "#FB923C",
+};
 
 export default function Matrix({ allBuildings, allData }) {
 
@@ -38,19 +30,13 @@ export default function Matrix({ allBuildings, allData }) {
   }
 
   // Only show functions that are actually assigned to at least one site building
-  const usedFns = FUNCTIONS.filter((fn) =>
+  const usedFns = ALL_FUNCTIONS.filter((fn) =>
     siteBuildings.some((b) => allData[b.path]?.function === fn)
   );
 
   const maxFloor = Math.max(...siteBuildings.map((b) => b.floors));
 
-  // ── cell[floor][fn] ──────────────────────────────────────────────────────────
-  // For each floor row and function column:
-  // count every building of that function whose floors >= this floor number.
-  // Example (sketch): floor 2, "3 Bed":
-  //   Building1 (6fl, 3-bed): 6 >= 2 ✓ → +1
-  //   Building2 (3fl, 3-bed): 3 >= 2 ✓ → +1
-  //   cell = 2
+  // ── Matrix cell: buildings of that function reaching that floor ───────────
   const matrix = {};
   for (let f = 1; f <= maxFloor; f++) {
     matrix[f] = {};
@@ -61,24 +47,29 @@ export default function Matrix({ allBuildings, allData }) {
     }
   }
 
-  // ── column totals = total units per function ─────────────────────────────────
-  // Each building contributes exactly (its floor count) units to its function column.
-  // This equals the sum of its column cells across all rows.
+  // ── Column totals = sum of floors per function ────────────────────────────
   const colTotals = {};
   for (const fn of usedFns) {
     colTotals[fn] = siteBuildings
       .filter((b) => allData[b.path]?.function === fn)
       .reduce((sum, b) => sum + b.floors, 0);
   }
+
+  // ── Unit total — ONLY bedroom functions count ─────────────────────────────
+  const totalUnits = usedFns
+    .filter((fn) => UNIT_FUNCTIONS.includes(fn))
+    .reduce((sum, fn) => sum + (colTotals[fn] || 0), 0);
+
+  // Grand total for percentage calculations (all functions)
   const grandTotal = Object.values(colTotals).reduce((a, b) => a + b, 0);
 
-  // ── row totals ────────────────────────────────────────────────────────────────
+  // ── Row totals ─────────────────────────────────────────────────────────────
   const rowTotals = {};
   for (let f = 1; f <= maxFloor; f++) {
     rowTotals[f] = usedFns.reduce((sum, fn) => sum + (matrix[f][fn] || 0), 0);
   }
 
-  // ── KPI values ────────────────────────────────────────────────────────────────
+  // ── KPI values ─────────────────────────────────────────────────────────────
   const totalGFA  = siteBuildings.reduce((sum, b) => sum + b.gfaSF, 0);
   const totalCost = siteBuildings.reduce((sum, b) => {
     const d = allData[b.path];
@@ -92,10 +83,10 @@ export default function Matrix({ allBuildings, allData }) {
       {/* KPI cards */}
       <div style={S.cards}>
         {[
-          { label: "Buildings",   value: siteBuildings.length },
-          { label: "Total Units", value: grandTotal },
-          { label: "Total GFA",   value: totalGFA > 0 ? `${(totalGFA / 1000).toFixed(0)}k SF` : "—" },
-          { label: "Est. Cost",   value: totalCost > 0 ? `$${(totalCost / 1e6).toFixed(1)}M` : "—" },
+          { label: "Buildings",        value: siteBuildings.length },
+          { label: "Residential Units", value: totalUnits },
+          { label: "Total GFA",        value: totalGFA > 0 ? `${(totalGFA / 1000).toFixed(0)}k SF` : "—" },
+          { label: "Est. Cost",        value: totalCost > 0 ? `$${(totalCost / 1e6).toFixed(1)}M` : "—" },
         ].map(({ label, value }) => (
           <div key={label} style={S.card}>
             <div style={S.cardVal}>{value}</div>
@@ -104,12 +95,20 @@ export default function Matrix({ allBuildings, allData }) {
         ))}
       </div>
 
-      {/* Legend */}
+      {/* Legend — show unit badge vs support badge */}
       <div style={S.legend}>
         {usedFns.map((fn) => (
           <div key={fn} style={S.legendItem}>
-            <div style={{ width: 7, height: 7, borderRadius: "50%", background: FN_COLOR[fn], flexShrink: 0 }} />
-            <span>{FN_SHORT[fn]}</span>
+            <div style={{
+              width: 7, height: 7, borderRadius: UNIT_FUNCTIONS.includes(fn) ? "50%" : "2px",
+              background: FN_COLOR[fn], flexShrink: 0,
+            }} />
+            <span style={{ color: UNIT_FUNCTIONS.includes(fn) ? "#9CA3AF" : "#6B7280" }}>
+              {FN_SHORT[fn]}
+            </span>
+            {!UNIT_FUNCTIONS.includes(fn) && (
+              <span style={{ fontSize: 8, color: "#4B5563", marginLeft: 1 }}>(support)</span>
+            )}
           </div>
         ))}
       </div>
@@ -122,7 +121,9 @@ export default function Matrix({ allBuildings, allData }) {
               <th style={{ ...S.th, textAlign: "left", color: "#4B5563" }}>Fl</th>
               {usedFns.map((fn) => (
                 <th key={fn} style={S.th}>
-                  <span style={{ color: FN_COLOR[fn] }}>{FN_SHORT[fn]}</span>
+                  <span style={{ color: FN_COLOR[fn], opacity: UNIT_FUNCTIONS.includes(fn) ? 1 : 0.5 }}>
+                    {FN_SHORT[fn]}
+                  </span>
                 </th>
               ))}
               <th style={{ ...S.th, color: "#E2E8F0" }}>Σ</th>
@@ -139,7 +140,13 @@ export default function Matrix({ allBuildings, allData }) {
                   return (
                     <td key={fn} style={S.td}>
                       {count > 0
-                        ? <span style={{ color: FN_COLOR[fn], fontWeight: 700, fontFamily: "monospace", fontSize: 13 }}>{count}</span>
+                        ? <span style={{
+                            color: FN_COLOR[fn],
+                            fontWeight: 700,
+                            fontFamily: "monospace",
+                            fontSize: 13,
+                            opacity: UNIT_FUNCTIONS.includes(fn) ? 1 : 0.5,
+                          }}>{count}</span>
                         : <span style={{ color: "#1F2937" }}>—</span>
                       }
                     </td>
@@ -156,13 +163,26 @@ export default function Matrix({ allBuildings, allData }) {
               <td style={{ ...S.tdTotal, textAlign: "left", color: "#9CA3AF" }}>Total</td>
               {usedFns.map((fn) => (
                 <td key={fn} style={S.tdTotal}>
-                  <div style={{ color: FN_COLOR[fn], fontWeight: 700 }}>{colTotals[fn]}</div>
-                  <div style={S.pct}>{grandTotal ? Math.round((colTotals[fn] / grandTotal) * 100) : 0}%</div>
+                  <div style={{
+                    color: FN_COLOR[fn],
+                    fontWeight: 700,
+                    opacity: UNIT_FUNCTIONS.includes(fn) ? 1 : 0.5,
+                  }}>
+                    {colTotals[fn]}
+                  </div>
+                  {UNIT_FUNCTIONS.includes(fn) && (
+                    <div style={S.pct}>
+                      {totalUnits ? Math.round((colTotals[fn] / totalUnits) * 100) : 0}% of units
+                    </div>
+                  )}
+                  {!UNIT_FUNCTIONS.includes(fn) && (
+                    <div style={{ ...S.pct, color: "#374151" }}>support</div>
+                  )}
                 </td>
               ))}
               <td style={{ ...S.tdTotal, color: "#E2E8F0" }}>
-                <div style={{ fontWeight: 700 }}>{grandTotal}</div>
-                <div style={S.pct}>100%</div>
+                <div style={{ fontWeight: 700 }}>{totalUnits}</div>
+                <div style={S.pct}>units</div>
               </td>
             </tr>
           </tfoot>
@@ -173,25 +193,31 @@ export default function Matrix({ allBuildings, allData }) {
       <div style={S.section}>
         <div style={S.sectionLabel}>By Building</div>
         {siteBuildings.map((b) => {
-          const d     = allData[b.path];
-          const fn    = d?.function ?? "—";
-          const color = FN_COLOR[fn] ?? "#6B7280";
-          const units = b.floors;
-          const pct   = grandTotal ? Math.round((units / grandTotal) * 100) : 0;
+          const d      = allData[b.path];
+          const fn     = d?.function ?? "—";
+          const color  = FN_COLOR[fn] ?? "#6B7280";
+          const isUnit = UNIT_FUNCTIONS.includes(fn);
+          const units  = b.floors;
+          const pct    = totalUnits && isUnit ? Math.round((units / totalUnits) * 100) : 0;
           return (
             <div key={b.path} style={S.bldgRow}>
               <div style={S.bldgHeader}>
-                <span style={{ color, fontWeight: 600, fontSize: 11 }}>{fn}</span>
+                <span style={{ color, fontWeight: 600, fontSize: 11 }}>
+                  {fn}
+                  {!isUnit && <span style={{ color: "#4B5563", fontWeight: 400, fontSize: 10 }}> (support)</span>}
+                </span>
                 <span style={{ color: "#6B7280", fontSize: 10, fontFamily: "monospace" }}>
                   {b.floors} fl · {b.gfaSF > 0 ? `${b.gfaSF.toLocaleString()} SF` : "—"}
                 </span>
               </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <div style={S.track}>
-                  <div style={{ ...S.bar, width: `${pct}%`, background: color }} />
+              {isUnit && (
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={S.track}>
+                    <div style={{ ...S.bar, width: `${pct}%`, background: color }} />
+                  </div>
+                  <span style={S.bldgCount}>{units} units · {pct}%</span>
                 </div>
-                <span style={S.bldgCount}>{units} units · {pct}%</span>
-              </div>
+              )}
             </div>
           );
         })}
@@ -203,15 +229,18 @@ export default function Matrix({ allBuildings, allData }) {
           <div style={S.sectionLabel}>By Phase</div>
           {phases.sort().map((phase) => {
             const pBuildings = siteBuildings.filter((b) => allData[b.path]?.phase === phase);
-            const pUnits     = pBuildings.reduce((s, b) => s + b.floors, 0);
-            const pPct       = grandTotal ? Math.round((pUnits / grandTotal) * 100) : 0;
+            // Only count unit-type buildings in phase totals
+            const pUnits = pBuildings
+              .filter((b) => UNIT_FUNCTIONS.includes(allData[b.path]?.function))
+              .reduce((s, b) => s + b.floors, 0);
+            const pPct = totalUnits ? Math.round((pUnits / totalUnits) * 100) : 0;
             return (
               <div key={phase} style={S.phaseRow}>
                 <span style={S.phaseLabel}>{phase}</span>
                 <div style={S.track}>
                   <div style={{ ...S.bar, width: `${pPct}%` }} />
                 </div>
-                <span style={S.bldgCount}>{pUnits} · {pPct}%</span>
+                <span style={S.bldgCount}>{pUnits} units · {pPct}%</span>
               </div>
             );
           })}
