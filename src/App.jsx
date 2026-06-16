@@ -20,66 +20,112 @@ export function saveElementData(path, data) {
 
 // ─── Read REAL properties from a Forma building path ─────────────────────────
 //
-// CORRECT SDK USAGE (verified against SDK type definitions):
+// Verified against SDK type definitions:
 //
-//  Step 1: Forma.elements.getByPath({ path })
-//          → returns { element }  where element.urn is the FULL URN
-//          → element.representations?.graphBuilding tells us if it exists
+//  Forma.elements.getByPath({ path })
+//    → element.urn            — full URN needed for representation calls
+//    → element.representations?.graphBuilding  — check before calling
+//    → element.representations?.grossFloorAreaPolygons — check before calling
 //
-//  Step 2: Forma.elements.representations.graphBuilding({ urn: element.urn })
-//          → returns { data: GraphBuilding }
-//          → data.levels: GraphBuildingLevel[]  → length = floor count
-//          → each level.height is in metres
+//  Forma.elements.representations.graphBuilding({ urn: element.urn })
+//    → data.levels: GraphBuildingLevel[]
+//    → levels.length = floor count  |  level.height in metres
 //
-//  Step 3: Forma.areaMetrics.calculate({ paths: [path] })
-//          → builtInMetrics.grossFloorArea.value  (m²)
-//          → builtInMetrics.buildingCoverage.value (m²)
+//  Forma.elements.representations.grossFloorAreaPolygons({ urn: element.urn })
+//    → data: GrossFloorAreaPolygon[]  — one polygon per floor
+//    → each polygon has an area we can sum for total GFA
+//
+//  Forma.areaMetrics.calculate({ paths: [path] })
+//    → builtInMetrics.grossFloorArea.value  (m²) — used as GFA fallback
+//    → builtInMetrics.buildingCoverage.value (m²) — footprint
 //
 async function readFormaElement(path) {
   try {
-    let floors   = 0;
-    let heightFt = 0;
+    let floors      = 0;
+    let heightFt    = 0;
     let gfaSF       = 0;
     let footprintSF = 0;
 
-    // ── Step 1 + 2: Get element by path, then fetch graphBuilding ─────────────
+    // ── Step 1: getByPath → element object ────────────────────────────────────
+    let element = null;
     try {
-      const { element } = await Forma.elements.getByPath({ path });
-
-      if (element?.representations?.graphBuilding) {
-        const gb = await Forma.elements.representations.graphBuilding({ urn: element.urn });
-        const levels = gb?.data?.levels ?? [];
-
-        if (levels.length > 0) {
-          floors         = levels.length;
-          const totalM   = levels.reduce((s, l) => s + (l.height ?? 0), 0);
-          heightFt       = totalM > 0 ? Math.round(totalM * 3.281) : floors * 10;
-        }
-      }
+      const result = await Forma.elements.getByPath({ path });
+      element = result?.element ?? null;
     } catch (e) {
-      console.warn("[Forma] graphBuilding fetch failed for", path, e);
+      console.warn("[Forma] getByPath failed for", path, e);
     }
 
-    // ── Step 3: areaMetrics for GFA + footprint ───────────────────────────────
+    // ── Step 2: graphBuilding → authoritative floors + height ─────────────────
+    if (element?.representations?.graphBuilding) {
+      try {
+        const gb     = await Forma.elements.representations.graphBuilding({ urn: element.urn });
+        const levels = gb?.data?.levels ?? [];
+        if (levels.length > 0) {
+          floors       = levels.length;
+          const totalM = levels.reduce((s, l) => s + (l.height ?? 0), 0);
+          heightFt     = totalM > 0 ? Math.round(totalM * 3.281) : floors * 10;
+        }
+      } catch (e) {
+        console.warn("[Forma] graphBuilding failed for", element.urn, e);
+      }
+    }
+
+    // ── Step 3: grossFloorAreaPolygons → precise GFA ──────────────────────────
+    // Each polygon has elevation — polygons at distinct elevations = one per floor.
+    // The polygon area is the floor plate area; summing all gives total GFA.
+    if (element?.representations?.grossFloorAreaPolygons) {
+      try {
+        const gfaRep = await Forma.elements.representations.grossFloorAreaPolygons({ urn: element.urn });
+        const polys  = gfaRep?.data ?? [];
+
+        // Sum the area of every GFA polygon (each is a flat floor plate in m²)
+        // A GrossFloorAreaPolygon has a `polygon` field with 3D coordinates [x,y,z].
+        // We compute the 2D (x,y) area of each using the shoelace formula.
+        let totalM2 = 0;
+        for (const poly of polys) {
+          const pts = poly?.polygon ?? [];
+          if (pts.length < 3) continue;
+          let area = 0;
+          for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+            area += (pts[j][0] + pts[i][0]) * (pts[j][1] - pts[i][1]);
+          }
+          totalM2 += Math.abs(area) / 2;
+        }
+        if (totalM2 > 0) gfaSF = Math.round(totalM2 * 10.764);
+
+        // If graphBuilding gave us 0 floors, use unique Z elevations as floor count
+        if (floors === 0 && polys.length > 0) {
+          const uniqueZ = new Set(polys.map((p) => Math.round((p?.polygon?.[0]?.[2] ?? 0) * 10)));
+          floors = Math.max(1, uniqueZ.size);
+        }
+      } catch (e) {
+        console.warn("[Forma] grossFloorAreaPolygons failed for", element?.urn, e);
+      }
+    }
+
+    // ── Step 4: areaMetrics → footprint + GFA/floors fallback ─────────────────
     try {
       const result = await Forma.areaMetrics.calculate({ paths: [path] });
       const bim    = result?.builtInMetrics ?? {};
       const gfaM2  = typeof bim.grossFloorArea?.value   === "number" ? bim.grossFloorArea.value   : 0;
       const covM2  = typeof bim.buildingCoverage?.value === "number" ? bim.buildingCoverage.value : 0;
 
-      gfaSF       = Math.round(gfaM2 * 10.764);
-      footprintSF = Math.round(covM2  * 10.764);
+      footprintSF = covM2 > 0 ? Math.round(covM2 * 10.764) : 0;
 
-      // Fallback: if graphBuilding gave nothing, derive floors from GFA/coverage
+      // Only use areaMetrics GFA if Step 3 gave us nothing
+      if (gfaSF === 0 && gfaM2 > 0) {
+        gfaSF = Math.round(gfaM2 * 10.764);
+      }
+
+      // Final floor fallback: GFA / footprint ratio
       if (floors === 0 && covM2 > 0 && gfaM2 > 0) {
-        floors   = Math.max(1, Math.round(gfaM2 / covM2));
-        heightFt = heightFt || (floors * 10);
+        floors = Math.max(1, Math.round(gfaM2 / covM2));
       }
     } catch (e) {
       console.warn("[Forma] areaMetrics failed for", path, e);
     }
 
-    // ── Final safety defaults ─────────────────────────────────────────────────
+    // ── Safety defaults ───────────────────────────────────────────────────────
     if (floors   === 0) floors   = 1;
     if (heightFt === 0) heightFt = floors * 10;
 
@@ -95,28 +141,22 @@ const TABS = ["Assign", "Matrix", "Visualize", "Report"];
 
 export default function App() {
   const [activeTab,    setActiveTab]    = useState("Assign");
-  const [selected,     setSelected]     = useState(null);   // { path, gfaSF, floors, heightFt, footprintSF }
-  const [allBuildings, setAllBuildings] = useState([]);     // all buildings with their Forma data
+  const [selected,     setSelected]     = useState(null);
+  const [allBuildings, setAllBuildings] = useState([]);
   const [allData,      setAllData]      = useState(loadAllData());
   const [status,       setStatus]       = useState("Click a building in Forma to begin");
 
-  // ── Reload all buildings (called on proposal change) ────────────────────────
   const reloadAllBuildings = useCallback(async () => {
     try {
       const paths = await Forma.geometry.getPathsByCategory({ category: "building" });
-      if (!paths || paths.length === 0) {
-        setAllBuildings([]);
-        return;
-      }
+      if (!paths || paths.length === 0) { setAllBuildings([]); return; }
       const buildings = await Promise.all(paths.map(readFormaElement));
       setAllBuildings(buildings.filter(Boolean));
     } catch {
-      // Outside Forma — use mock data
       setAllBuildings(MOCK_BUILDINGS);
     }
   }, []);
 
-  // ── Subscribe to SELECTION — fires when user clicks a building in Forma ─────
   useEffect(() => {
     let unsubSelection;
     try {
@@ -133,19 +173,15 @@ export default function App() {
         setActiveTab("Assign");
       });
     } catch {
-      // Outside Forma — auto-select first mock building
       setSelected(MOCK_BUILDINGS[0]);
       setAllBuildings(MOCK_BUILDINGS);
       setStatus(null);
     }
-
     return () => { if (typeof unsubSelection === "function") unsubSelection(); };
   }, []);
 
-  // ── Subscribe to PROPOSAL changes — fires when buildings are modified ────────
   useEffect(() => {
     reloadAllBuildings();
-
     let unsubProposal;
     try {
       unsubProposal = Forma.proposal.subscribe(async () => {
@@ -156,17 +192,11 @@ export default function App() {
           return prev;
         });
       });
-    } catch {
-      // Outside Forma — no subscription needed
-    }
-
+    } catch { /* outside Forma */ }
     return () => { if (typeof unsubProposal === "function") unsubProposal(); };
   }, [reloadAllBuildings]);
 
-  // Refresh allData from localStorage on tab switch
-  useEffect(() => {
-    setAllData(loadAllData());
-  }, [activeTab]);
+  useEffect(() => { setAllData(loadAllData()); }, [activeTab]);
 
   function handleSave(path, data) {
     saveElementData(path, data);
@@ -175,8 +205,6 @@ export default function App() {
 
   return (
     <div style={S.root}>
-
-      {/* Header */}
       <div style={S.header}>
         <div style={S.headerTitle}>Affordable Housing</div>
         {selected ? (
@@ -188,7 +216,6 @@ export default function App() {
         )}
       </div>
 
-      {/* Tab bar */}
       <div style={S.tabBar}>
         {TABS.map((tab) => (
           <button
@@ -201,21 +228,9 @@ export default function App() {
         ))}
       </div>
 
-      {/* Content */}
       <div style={S.content}>
-        {activeTab === "Assign" && (
-          <Assign
-            selected={selected}
-            allData={allData}
-            onSave={handleSave}
-          />
-        )}
-        {activeTab === "Matrix" && (
-          <Matrix
-            allBuildings={allBuildings}
-            allData={allData}
-          />
-        )}
+        {activeTab === "Assign"    && <Assign selected={selected} allData={allData} onSave={handleSave} />}
+        {activeTab === "Matrix"    && <Matrix allBuildings={allBuildings} allData={allData} />}
         {activeTab === "Visualize" && <Placeholder label="Visualize" note="Charts — coming next" />}
         {activeTab === "Report"    && <Placeholder label="Report"    note="Export — coming next" />}
       </div>
@@ -232,7 +247,6 @@ function Placeholder({ label, note }) {
   );
 }
 
-// ─── Mock buildings for dev/testing outside Forma ─────────────────────────────
 const MOCK_BUILDINGS = [
   { path: "/mock/bldg-001", gfaSF: 13200, floors: 6,  heightFt: 62,  footprintSF: 2200 },
   { path: "/mock/bldg-002", gfaSF: 8500,  floors: 4,  heightFt: 42,  footprintSF: 2125 },
