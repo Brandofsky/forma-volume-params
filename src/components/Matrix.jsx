@@ -1,10 +1,28 @@
-const FUNCTIONS  = ["3 Bedroom", "2 Bedroom", "1 Bedroom", "Core", "Corridor", "Amenity"];
-const FN_SHORT   = { "3 Bedroom": "3 Bed", "2 Bedroom": "2 Bed", "1 Bedroom": "1 Bed", "Core": "Core", "Corridor": "Corr", "Amenity": "Amen" };
-const FN_COLOR   = { "3 Bedroom": "#60A5FA", "2 Bedroom": "#34D399", "1 Bedroom": "#FBBF24", "Core": "#F87171", "Corridor": "#A78BFA", "Amenity": "#FB923C" };
+// Matrix logic — based on sketch:
+//
+// Building 1: 6 floors, 3-Bedroom
+// Building 2: 3 floors, 3-Bedroom
+//
+// Floor | 3-Bed        | Σ
+// ------+--------------+---
+//   1   | 1 + 1 = 2    | 2
+//   2   | 1 + 1 = 2    | 2
+//   3   | 1 + 1 = 2    | 2
+//   4   | 1            | 1
+//   5   | 1            | 1
+//   6   | 1            | 1
+// Total | 6 + 3 = 9    | 9
+//
+// cell[floor][fn] = number of buildings with that fn whose floor count >= floor
+// colTotal[fn]    = sum of all floors across buildings with that fn
+// grandTotal      = sum of colTotals = total units across site
+
+const FUNCTIONS = ["3 Bedroom", "2 Bedroom", "1 Bedroom", "Core", "Corridor", "Amenity"];
+const FN_SHORT  = { "3 Bedroom": "3 Bed", "2 Bedroom": "2 Bed", "1 Bedroom": "1 Bed", "Core": "Core", "Corridor": "Corr", "Amenity": "Amen" };
+const FN_COLOR  = { "3 Bedroom": "#60A5FA", "2 Bedroom": "#34D399", "1 Bedroom": "#FBBF24", "Core": "#F87171", "Corridor": "#A78BFA", "Amenity": "#FB923C" };
 
 export default function Matrix({ allBuildings, allData }) {
 
-  // Only buildings toggled "within site" in Assign tab
   const siteBuildings = allBuildings.filter((b) => allData[b.path]?.withinSite);
 
   if (siteBuildings.length === 0) {
@@ -13,22 +31,26 @@ export default function Matrix({ allBuildings, allData }) {
         <div style={S.emptyIcon}>⬡</div>
         <div style={S.emptyTitle}>No buildings in site</div>
         <div style={S.emptyNote}>
-          Select each building in Forma → Assign tab → toggle "Within Site Limit" on
+          Select each building → Assign tab → toggle "Within Site Limit" on
         </div>
       </div>
     );
   }
 
-  // Functions actually used in site
+  // Only show functions that are actually assigned to at least one site building
   const usedFns = FUNCTIONS.filter((fn) =>
     siteBuildings.some((b) => allData[b.path]?.function === fn)
   );
 
-  // Max floor across all site buildings (from REAL Forma data)
   const maxFloor = Math.max(...siteBuildings.map((b) => b.floors));
 
-  // Matrix: matrix[floor][fn] = count of buildings that have that fn AND reach that floor
-  // 1 unit per floor per building — count of buildings = count of units on that floor
+  // ── cell[floor][fn] ──────────────────────────────────────────────────────────
+  // For each floor row and function column:
+  // count every building of that function whose floors >= this floor number.
+  // Example (sketch): floor 2, "3 Bed":
+  //   Building1 (6fl, 3-bed): 6 >= 2 ✓ → +1
+  //   Building2 (3fl, 3-bed): 3 >= 2 ✓ → +1
+  //   cell = 2
   const matrix = {};
   for (let f = 1; f <= maxFloor; f++) {
     matrix[f] = {};
@@ -39,7 +61,9 @@ export default function Matrix({ allBuildings, allData }) {
     }
   }
 
-  // Column totals = sum of floors for each function type
+  // ── column totals = total units per function ─────────────────────────────────
+  // Each building contributes exactly (its floor count) units to its function column.
+  // This equals the sum of its column cells across all rows.
   const colTotals = {};
   for (const fn of usedFns) {
     colTotals[fn] = siteBuildings
@@ -48,19 +72,19 @@ export default function Matrix({ allBuildings, allData }) {
   }
   const grandTotal = Object.values(colTotals).reduce((a, b) => a + b, 0);
 
-  // Row totals
+  // ── row totals ────────────────────────────────────────────────────────────────
   const rowTotals = {};
   for (let f = 1; f <= maxFloor; f++) {
     rowTotals[f] = usedFns.reduce((sum, fn) => sum + (matrix[f][fn] || 0), 0);
   }
 
-  // Total GFA across site buildings (live from Forma)
-  const totalGFA   = siteBuildings.reduce((sum, b) => sum + b.gfaSF, 0);
-  const totalCost  = siteBuildings.reduce((sum, b) => {
+  // ── KPI values ────────────────────────────────────────────────────────────────
+  const totalGFA  = siteBuildings.reduce((sum, b) => sum + b.gfaSF, 0);
+  const totalCost = siteBuildings.reduce((sum, b) => {
     const d = allData[b.path];
     return sum + (d?.costPerSF ? b.gfaSF * parseFloat(d.costPerSF) : 0);
   }, 0);
-  const phases     = [...new Set(siteBuildings.map((b) => allData[b.path]?.phase).filter(Boolean))];
+  const phases = [...new Set(siteBuildings.map((b) => allData[b.path]?.phase).filter(Boolean))];
 
   return (
     <div style={S.root}>
@@ -70,7 +94,7 @@ export default function Matrix({ allBuildings, allData }) {
         {[
           { label: "Buildings",   value: siteBuildings.length },
           { label: "Total Units", value: grandTotal },
-          { label: "Total GFA",   value: `${(totalGFA / 1000).toFixed(0)}k SF` },
+          { label: "Total GFA",   value: totalGFA > 0 ? `${(totalGFA / 1000).toFixed(0)}k SF` : "—" },
           { label: "Est. Cost",   value: totalCost > 0 ? `$${(totalCost / 1e6).toFixed(1)}M` : "—" },
         ].map(({ label, value }) => (
           <div key={label} style={S.card}>
@@ -145,9 +169,37 @@ export default function Matrix({ allBuildings, allData }) {
         </table>
       </div>
 
+      {/* Per-building breakdown */}
+      <div style={S.section}>
+        <div style={S.sectionLabel}>By Building</div>
+        {siteBuildings.map((b) => {
+          const d     = allData[b.path];
+          const fn    = d?.function ?? "—";
+          const color = FN_COLOR[fn] ?? "#6B7280";
+          const units = b.floors;
+          const pct   = grandTotal ? Math.round((units / grandTotal) * 100) : 0;
+          return (
+            <div key={b.path} style={S.bldgRow}>
+              <div style={S.bldgHeader}>
+                <span style={{ color, fontWeight: 600, fontSize: 11 }}>{fn}</span>
+                <span style={{ color: "#6B7280", fontSize: 10, fontFamily: "monospace" }}>
+                  {b.floors} fl · {b.gfaSF > 0 ? `${b.gfaSF.toLocaleString()} SF` : "—"}
+                </span>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <div style={S.track}>
+                  <div style={{ ...S.bar, width: `${pct}%`, background: color }} />
+                </div>
+                <span style={S.bldgCount}>{units} units · {pct}%</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
       {/* Phase breakdown */}
       {phases.length > 0 && (
-        <div style={S.phaseSection}>
+        <div style={S.section}>
           <div style={S.sectionLabel}>By Phase</div>
           {phases.sort().map((phase) => {
             const pBuildings = siteBuildings.filter((b) => allData[b.path]?.phase === phase);
@@ -156,10 +208,10 @@ export default function Matrix({ allBuildings, allData }) {
             return (
               <div key={phase} style={S.phaseRow}>
                 <span style={S.phaseLabel}>{phase}</span>
-                <div style={S.phaseTrack}>
-                  <div style={{ ...S.phaseBar, width: `${pPct}%` }} />
+                <div style={S.track}>
+                  <div style={{ ...S.bar, width: `${pPct}%` }} />
                 </div>
-                <span style={S.phaseCount}>{pUnits} · {pPct}%</span>
+                <span style={S.bldgCount}>{pUnits} · {pPct}%</span>
               </div>
             );
           })}
@@ -170,30 +222,32 @@ export default function Matrix({ allBuildings, allData }) {
 }
 
 const S = {
-  root:         { display: "flex", flexDirection: "column", padding: "10px 0 24px" },
-  empty:        { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "60px 24px", gap: 10, textAlign: "center" },
-  emptyIcon:    { fontSize: 32, opacity: 0.15 },
-  emptyTitle:   { fontSize: 14, fontWeight: 700, color: "#E2E8F0", opacity: 0.3 },
-  emptyNote:    { fontSize: 12, color: "#4B5563", lineHeight: 1.6 },
-  cards:        { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6, padding: "0 12px 10px" },
-  card:         { background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 7, padding: "8px 6px", textAlign: "center" },
-  cardVal:      { fontSize: 15, fontWeight: 700, color: "#E2E8F0", fontFamily: "monospace" },
-  cardLabel:    { fontSize: 9, letterSpacing: "0.07em", textTransform: "uppercase", color: "#6B7280", marginTop: 2 },
-  legend:       { display: "flex", gap: 10, padding: "0 12px 10px", flexWrap: "wrap" },
-  legendItem:   { display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#9CA3AF" },
-  tableWrap:    { overflowX: "auto", padding: "0 12px" },
-  table:        { width: "100%", borderCollapse: "collapse", fontSize: 12 },
-  th:           { padding: "7px 6px", textAlign: "center", fontSize: 10, letterSpacing: "0.06em", color: "#6B7280", fontFamily: "monospace", borderBottom: "1px solid rgba(255,255,255,0.08)", fontWeight: 600 },
-  td:           { padding: "6px 6px", textAlign: "center", borderBottom: "1px solid rgba(255,255,255,0.04)" },
-  rowEven:      { background: "rgba(255,255,255,0.015)" },
-  totalRow:     { background: "rgba(0,0,0,0.3)", borderTop: "1px solid rgba(255,255,255,0.1)" },
-  tdTotal:      { padding: "8px 6px", textAlign: "center", fontSize: 12, fontFamily: "monospace" },
-  pct:          { fontSize: 9, color: "#6B7280", marginTop: 2 },
-  phaseSection: { padding: "14px 12px 0" },
-  sectionLabel: { fontSize: 9, letterSpacing: "0.09em", textTransform: "uppercase", color: "#4B5563", fontFamily: "monospace", marginBottom: 10 },
-  phaseRow:     { display: "flex", alignItems: "center", gap: 8, marginBottom: 8 },
-  phaseLabel:   { fontSize: 11, color: "#FBBF24", fontFamily: "monospace", width: 54, flexShrink: 0 },
-  phaseTrack:   { flex: 1, height: 4, background: "rgba(255,255,255,0.06)", borderRadius: 2 },
-  phaseBar:     { height: "100%", background: "#FBBF24", borderRadius: 2, opacity: 0.7, transition: "width 0.4s" },
-  phaseCount:   { fontSize: 10, color: "#6B7280", whiteSpace: "nowrap", width: 70, textAlign: "right" },
+  root:        { display: "flex", flexDirection: "column", padding: "10px 0 24px" },
+  empty:       { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "60px 24px", gap: 10, textAlign: "center" },
+  emptyIcon:   { fontSize: 32, opacity: 0.15 },
+  emptyTitle:  { fontSize: 14, fontWeight: 700, color: "#E2E8F0", opacity: 0.3 },
+  emptyNote:   { fontSize: 12, color: "#4B5563", lineHeight: 1.6 },
+  cards:       { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6, padding: "0 12px 10px" },
+  card:        { background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 7, padding: "8px 6px", textAlign: "center" },
+  cardVal:     { fontSize: 15, fontWeight: 700, color: "#E2E8F0", fontFamily: "monospace" },
+  cardLabel:   { fontSize: 9, letterSpacing: "0.07em", textTransform: "uppercase", color: "#6B7280", marginTop: 2 },
+  legend:      { display: "flex", gap: 10, padding: "0 12px 10px", flexWrap: "wrap" },
+  legendItem:  { display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#9CA3AF" },
+  tableWrap:   { overflowX: "auto", padding: "0 12px" },
+  table:       { width: "100%", borderCollapse: "collapse", fontSize: 12 },
+  th:          { padding: "7px 6px", textAlign: "center", fontSize: 10, letterSpacing: "0.06em", color: "#6B7280", fontFamily: "monospace", borderBottom: "1px solid rgba(255,255,255,0.08)", fontWeight: 600 },
+  td:          { padding: "6px 6px", textAlign: "center", borderBottom: "1px solid rgba(255,255,255,0.04)" },
+  rowEven:     { background: "rgba(255,255,255,0.015)" },
+  totalRow:    { background: "rgba(0,0,0,0.3)", borderTop: "1px solid rgba(255,255,255,0.1)" },
+  tdTotal:     { padding: "8px 6px", textAlign: "center", fontSize: 12, fontFamily: "monospace" },
+  pct:         { fontSize: 9, color: "#6B7280", marginTop: 2 },
+  section:     { padding: "14px 12px 0" },
+  sectionLabel:{ fontSize: 9, letterSpacing: "0.09em", textTransform: "uppercase", color: "#4B5563", fontFamily: "monospace", marginBottom: 10 },
+  bldgRow:     { marginBottom: 10, paddingBottom: 10, borderBottom: "1px solid rgba(255,255,255,0.04)" },
+  bldgHeader:  { display: "flex", justifyContent: "space-between", marginBottom: 4 },
+  phaseRow:    { display: "flex", alignItems: "center", gap: 8, marginBottom: 8 },
+  phaseLabel:  { fontSize: 11, color: "#FBBF24", fontFamily: "monospace", width: 54, flexShrink: 0 },
+  track:       { flex: 1, height: 4, background: "rgba(255,255,255,0.06)", borderRadius: 2 },
+  bar:         { height: "100%", background: "#FBBF24", borderRadius: 2, opacity: 0.7, transition: "width 0.4s" },
+  bldgCount:   { fontSize: 10, color: "#6B7280", whiteSpace: "nowrap", width: 80, textAlign: "right" },
 };
