@@ -1,24 +1,25 @@
-// Matrix logic with new data shape:
-// allData[path] = { withinSite, phase, functions: { [functionId]: { costPerSF } } }
-// allBuildings[n] = { path, floors, gfaSF, heightFt, footprintSF,
-//                     breakdown: [{ functionId, functionName, functionColor, gfaSF }] }
+// ─── Matrix — per-floor function counts ──────────────────────────────────────
 //
-// NOTE: breakdown is now read from areaMetrics in App.jsx and passed through allBuildings
-// So each building already has per-function GFA — no need to guess or divide by floors.
+// Data source: b.floorFunctions[floorIndex] = Set<functionName>
+//   Built in App.jsx by matching graphBuilding.levels[n].spaces[].id
+//   against units[].spaceIds[] → units[].properties.function
+//   This is the ONLY correct source for per-floor function data.
+//   areaMetrics.functionBreakdown gives TOTAL GFA per function, NOT per floor.
 //
-// Matrix rows = floors (1 to maxFloor)
-// Matrix cols = unique functions across all site buildings
-// Cell value  = number of buildings that have that function AND have floors >= row
+// Matrix cell[floor][fn]:
+//   Count of site buildings where floorFunctions[floor-1].has(fn)
+//   i.e. "how many buildings have function X on floor N"
+//
+// Non-typical plans are handled naturally:
+//   If building has Amenity only on floor 1, cell[1][Amenity]=1, cell[2][Amenity]=0
 
-const UNIT_FUNCTION_KEYWORDS = ["bedroom", "bed", "br", "studio", "unit", "residential", "apartment"];
+const UNIT_KEYWORDS = ["bedroom", "bed", "br", "studio", "unit", "residential", "apartment", "living"];
 
-function isUnitFunction(name = "") {
-  const lower = name.toLowerCase();
-  return UNIT_FUNCTION_KEYWORDS.some(k => lower.includes(k));
+function isUnit(name = "") {
+  return UNIT_KEYWORDS.some(k => name.toLowerCase().includes(k));
 }
 
 export default function Matrix({ allBuildings, allData }) {
-
   const siteBuildings = allBuildings.filter(b => allData[b.path]?.withinSite);
 
   if (siteBuildings.length === 0) {
@@ -26,87 +27,94 @@ export default function Matrix({ allBuildings, allData }) {
       <div style={S.empty}>
         <div style={S.emptyIcon}>⬡</div>
         <div style={S.emptyTitle}>No buildings in site</div>
-        <div style={S.emptyNote}>
-          Select each building → Assign tab → toggle "Within Site Limit" on
-        </div>
+        <div style={S.emptyNote}>Select each building → Assign tab → toggle "Within Site Limit" on</div>
       </div>
     );
   }
 
-  // Collect all unique functions across site buildings (from breakdown)
-  const fnMap = {}; // functionId → { functionName, functionColor }
+  // Collect all unique function names across all site buildings
+  const fnNames = new Set();
   for (const b of siteBuildings) {
-    for (const fn of (b.breakdown ?? [])) {
-      if (!fnMap[fn.functionId]) {
-        fnMap[fn.functionId] = { functionName: fn.functionName, functionColor: fn.functionColor };
-      }
+    for (const fns of (b.floorFunctions ?? [])) {
+      for (const fn of fns) fnNames.add(fn);
     }
   }
-  const allFnIds = Object.keys(fnMap);
+  const allFns = [...fnNames];
 
-  if (allFnIds.length === 0) {
+  if (allFns.length === 0) {
     return (
       <div style={S.empty}>
         <div style={S.emptyIcon}>◎</div>
         <div style={S.emptyTitle}>No functions assigned</div>
         <div style={S.emptyNote}>
-          In Forma's right panel, open Building → Floor Plans and assign functions to floors, then come back here.
+          In Forma's right panel → Building → Floor Plans → assign functions to floors, then return here.
         </div>
       </div>
     );
   }
 
-  const unitFnIds    = allFnIds.filter(id => isUnitFunction(fnMap[id].functionName));
-  const supportFnIds = allFnIds.filter(id => !isUnitFunction(fnMap[id].functionName));
-  const maxFloor     = Math.max(...siteBuildings.map(b => b.floors));
+  const unitFns   = allFns.filter(isUnit);
+  const maxFloor  = Math.max(...siteBuildings.map(b => b.floors));
 
-  // ── Matrix cell: buildings with this function present on this floor ───────
-  // A building "has a function on floor f" if:
-  //   - it has that function in its breakdown (meaning at least 1 floor uses it)
-  //   - AND its total floor count >= f
-  // (We don't have per-floor breakdown from areaMetrics, only total GFA per function)
+  // fn color from any building's fnMeta
+  function getColor(fnName) {
+    for (const b of siteBuildings) {
+      const meta = b.fnMeta?.[fnName];
+      if (meta?.functionColor) return meta.functionColor;
+    }
+    return "#94A3B8";
+  }
+
+  // ── Matrix cell: exact count from floorFunctions ──────────────────────────
+  // cell[floor][fn] = buildings that have fn on that specific floor
   const matrix = {};
   for (let f = 1; f <= maxFloor; f++) {
     matrix[f] = {};
-    for (const fnId of allFnIds) {
-      matrix[f][fnId] = siteBuildings.filter(b => {
-        const hasFn = (b.breakdown ?? []).some(fn => fn.functionId === fnId);
-        return hasFn && b.floors >= f;
+    for (const fn of allFns) {
+      matrix[f][fn] = siteBuildings.filter(b => {
+        const ffs = b.floorFunctions ?? [];
+        // floor index is f-1 (0-based), only count if building has that floor
+        return f <= b.floors && ffs[f - 1]?.has(fn);
       }).length;
     }
   }
 
-  // ── Column totals = sum of floors for buildings that have that function ───
+  // ── Column totals = sum over all floors ───────────────────────────────────
+  // This correctly accounts for non-typical plans:
+  // If building A has fn on floors 1-5 and building B has fn on floors 2-4 only:
+  //   floor 1: 1, floor 2: 2, floor 3: 2, floor 4: 2, floor 5: 1 → total = 8
   const colTotals = {};
-  for (const fnId of allFnIds) {
-    colTotals[fnId] = siteBuildings
-      .filter(b => (b.breakdown ?? []).some(fn => fn.functionId === fnId))
-      .reduce((sum, b) => sum + b.floors, 0);
-  }
-
-  const unitTotal  = unitFnIds.reduce((s, id) => s + (colTotals[id] || 0), 0);
-  const grandTotal = allFnIds.reduce((s, id) => s + (colTotals[id] || 0), 0);
-
-  const rowTotals = {};
-  for (let f = 1; f <= maxFloor; f++) {
-    rowTotals[f] = allFnIds.reduce((s, id) => s + (matrix[f][id] || 0), 0);
-  }
-
-  // ── GFA and cost per function across all site buildings ───────────────────
-  const fnGFA = {};
-  const fnCost = {};
-  for (const fnId of allFnIds) {
-    fnGFA[fnId] = 0;
-    fnCost[fnId] = 0;
-    for (const b of siteBuildings) {
-      const fn = (b.breakdown ?? []).find(fn => fn.functionId === fnId);
-      if (!fn) continue;
-      fnGFA[fnId] += fn.gfaSF;
-      const cpsf = parseFloat(allData[b.path]?.functions?.[fnId]?.costPerSF) || 0;
-      fnCost[fnId] += fn.gfaSF * cpsf;
+  for (const fn of allFns) {
+    colTotals[fn] = 0;
+    for (let f = 1; f <= maxFloor; f++) {
+      colTotals[fn] += matrix[f][fn] || 0;
     }
   }
 
+  const unitTotal  = unitFns.reduce((s, fn) => s + (colTotals[fn] || 0), 0);
+  const grandTotal = allFns.reduce((s, fn) => s + (colTotals[fn] || 0), 0);
+
+  const rowTotals = {};
+  for (let f = 1; f <= maxFloor; f++) {
+    rowTotals[f] = allFns.reduce((s, fn) => s + (matrix[f][fn] || 0), 0);
+  }
+
+  // ── GFA and cost per function ─────────────────────────────────────────────
+  const fnGFA  = {};
+  const fnCost = {};
+  for (const fn of allFns) {
+    fnGFA[fn]  = 0;
+    fnCost[fn] = 0;
+    for (const b of siteBuildings) {
+      const bfn  = (b.breakdown ?? []).find(bd => bd.functionName === fn);
+      if (!bfn) continue;
+      fnGFA[fn] += bfn.gfaSF;
+      // Find cost from allData using functionId
+      const fnId = bfn.functionId;
+      const cpsf = parseFloat(allData[b.path]?.functions?.[fnId]?.costPerSF) || 0;
+      fnCost[fn] += bfn.gfaSF * cpsf;
+    }
+  }
   const totalGFA  = Object.values(fnGFA).reduce((a, b) => a + b, 0);
   const totalCost = Object.values(fnCost).reduce((a, b) => a + b, 0);
   const phases    = [...new Set(siteBuildings.map(b => allData[b.path]?.phase).filter(Boolean))].sort();
@@ -117,10 +125,10 @@ export default function Matrix({ allBuildings, allData }) {
       {/* KPI cards */}
       <div style={S.cards}>
         {[
-          { label: "Buildings",    value: siteBuildings.length },
-          { label: "Units",        value: unitTotal },
-          { label: "Total GFA",    value: totalGFA > 0 ? `${(totalGFA/1000).toFixed(0)}k SF` : "—" },
-          { label: "Est. Cost",    value: totalCost > 0 ? `$${(totalCost/1e6).toFixed(1)}M` : "—" },
+          { label: "Buildings", value: siteBuildings.length },
+          { label: "Unit Floors", value: unitTotal },
+          { label: "Total GFA",  value: totalGFA > 0 ? `${(totalGFA/1000).toFixed(0)}k SF` : "—" },
+          { label: "Est. Cost",  value: totalCost > 0 ? `$${(totalCost/1e6).toFixed(1)}M` : "—" },
         ].map(({ label, value }) => (
           <div key={label} style={S.card}>
             <div style={S.cardVal}>{value}</div>
@@ -131,14 +139,14 @@ export default function Matrix({ allBuildings, allData }) {
 
       {/* Legend */}
       <div style={S.legend}>
-        {allFnIds.map(id => {
-          const { functionName: name, functionColor: color } = fnMap[id];
-          const isUnit = isUnitFunction(name);
+        {allFns.map(fn => {
+          const color  = getColor(fn);
+          const unit   = isUnit(fn);
           return (
-            <div key={id} style={S.legendItem}>
-              <div style={{ width: 7, height: 7, borderRadius: isUnit ? "50%" : "2px", background: color, flexShrink: 0 }} />
-              <span style={{ color: isUnit ? "#9CA3AF" : "#6B7280" }}>{name}</span>
-              {!isUnit && <span style={{ fontSize: 8, color: "#4B5563" }}>(support)</span>}
+            <div key={fn} style={S.legendItem}>
+              <div style={{ width: 7, height: 7, borderRadius: unit ? "50%" : "2px", background: color, flexShrink: 0 }} />
+              <span style={{ color: unit ? "#9CA3AF" : "#6B7280" }}>{fn}</span>
+              {!unit && <span style={{ fontSize: 8, color: "#4B5563" }}>(support)</span>}
             </div>
           );
         })}
@@ -150,15 +158,10 @@ export default function Matrix({ allBuildings, allData }) {
           <thead>
             <tr>
               <th style={{ ...S.th, textAlign: "left", color: "#4B5563" }}>Fl</th>
-              {allFnIds.map(id => (
-                <th key={id} style={S.th}>
-                  <span style={{
-                    color: fnMap[id].functionColor,
-                    opacity: isUnitFunction(fnMap[id].functionName) ? 1 : 0.5,
-                  }}>
-                    {fnMap[id].functionName.length > 6
-                      ? fnMap[id].functionName.slice(0, 5) + "…"
-                      : fnMap[id].functionName}
+              {allFns.map(fn => (
+                <th key={fn} style={S.th}>
+                  <span style={{ color: getColor(fn), opacity: isUnit(fn) ? 1 : 0.5, fontSize: 9 }}>
+                    {fn.length > 6 ? fn.slice(0,5) + "…" : fn}
                   </span>
                 </th>
               ))}
@@ -171,12 +174,13 @@ export default function Matrix({ allBuildings, allData }) {
                 <td style={{ ...S.td, color: "#6B7280", fontFamily: "monospace", fontWeight: 600, fontSize: 11 }}>
                   {floor}
                 </td>
-                {allFnIds.map(id => {
-                  const count = matrix[floor][id] || 0;
+                {allFns.map(fn => {
+                  const count = matrix[floor][fn] || 0;
+                  const color = getColor(fn);
                   return (
-                    <td key={id} style={S.td}>
+                    <td key={fn} style={S.td}>
                       {count > 0
-                        ? <span style={{ color: fnMap[id].functionColor, fontWeight: 700, fontFamily: "monospace", fontSize: 13, opacity: isUnitFunction(fnMap[id].functionName) ? 1 : 0.5 }}>{count}</span>
+                        ? <span style={{ color, fontWeight: 700, fontFamily: "monospace", fontSize: 13, opacity: isUnit(fn) ? 1 : 0.45 }}>{count}</span>
                         : <span style={{ color: "#1F2937" }}>—</span>
                       }
                     </td>
@@ -191,15 +195,14 @@ export default function Matrix({ allBuildings, allData }) {
           <tfoot>
             <tr style={S.totalRow}>
               <td style={{ ...S.tdTotal, textAlign: "left", color: "#9CA3AF" }}>Total</td>
-              {allFnIds.map(id => {
-                const isUnit = isUnitFunction(fnMap[id].functionName);
+              {allFns.map(fn => {
+                const unit  = isUnit(fn);
+                const color = getColor(fn);
                 return (
-                  <td key={id} style={S.tdTotal}>
-                    <div style={{ color: fnMap[id].functionColor, fontWeight: 700, opacity: isUnit ? 1 : 0.5 }}>
-                      {colTotals[id]}
-                    </div>
-                    {isUnit
-                      ? <div style={S.pct}>{unitTotal ? Math.round((colTotals[id]/unitTotal)*100) : 0}%</div>
+                  <td key={fn} style={S.tdTotal}>
+                    <div style={{ color, fontWeight: 700, opacity: unit ? 1 : 0.5 }}>{colTotals[fn]}</div>
+                    {unit
+                      ? <div style={S.pct}>{unitTotal ? Math.round((colTotals[fn]/unitTotal)*100) : 0}%</div>
                       : <div style={{ ...S.pct, color: "#374151" }}>support</div>
                     }
                   </td>
@@ -214,24 +217,24 @@ export default function Matrix({ allBuildings, allData }) {
         </table>
       </div>
 
-      {/* GFA + Cost breakdown per function */}
+      {/* GFA + cost by function */}
       <div style={S.section}>
         <div style={S.sectionLabel}>GFA & Cost by Function</div>
-        {allFnIds.map(id => {
-          const { functionName: name, functionColor: color } = fnMap[id];
-          const gfa  = fnGFA[id];
-          const cost = fnCost[id];
-          const pct  = totalGFA > 0 ? Math.round((gfa / totalGFA) * 100) : 0;
+        {allFns.map(fn => {
+          const color = getColor(fn);
+          const gfa   = fnGFA[fn] || 0;
+          const cost  = fnCost[fn] || 0;
+          const pct   = totalGFA > 0 ? Math.round((gfa / totalGFA) * 100) : 0;
           return (
-            <div key={id} style={S.fnRow}>
+            <div key={fn} style={S.fnRow}>
               <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <div style={{ width: 7, height: 7, borderRadius: "50%", background: color }} />
-                  <span style={{ fontSize: 11, color, fontWeight: 600 }}>{name}</span>
+                  <span style={{ fontSize: 11, color, fontWeight: 600 }}>{fn}</span>
                 </div>
                 <span style={{ fontSize: 10, color: "#6B7280", fontFamily: "monospace" }}>
                   {gfa.toLocaleString()} SF · {pct}%
-                  {cost > 0 && <span style={{ color: "#34D399", marginLeft: 6 }}>${Math.round(cost).toLocaleString()}</span>}
+                  {cost > 0 && <span style={{ color: "#34D399", marginLeft: 5 }}>${Math.round(cost).toLocaleString()}</span>}
                 </span>
               </div>
               <div style={{ height: 3, background: "rgba(255,255,255,0.05)", borderRadius: 2 }}>
@@ -255,19 +258,21 @@ export default function Matrix({ allBuildings, allData }) {
         <div style={S.section}>
           <div style={S.sectionLabel}>By Phase</div>
           {phases.map(phase => {
-            const pBldgs = siteBuildings.filter(b => allData[b.path]?.phase === phase);
-            const pUnits = pBldgs
-              .filter(b => (b.breakdown ?? []).some(fn => isUnitFunction(fn.functionName)))
-              .reduce((s, b) => s + b.floors, 0);
-            const pGFA   = pBldgs.reduce((s, b) => s + b.gfaSF, 0);
-            const pPct   = unitTotal ? Math.round((pUnits / unitTotal) * 100) : 0;
+            const pb    = siteBuildings.filter(b => allData[b.path]?.phase === phase);
+            const pUnit = pb.reduce((s, b) => {
+              // Sum only unit-function floors from floorFunctions
+              const ffs = b.floorFunctions ?? [];
+              return s + ffs.filter(fns => [...fns].some(isUnit)).length;
+            }, 0);
+            const pGFA  = pb.reduce((s, b) => s + b.gfaSF, 0);
+            const pPct  = unitTotal ? Math.round((pUnit / unitTotal) * 100) : 0;
             return (
               <div key={phase} style={S.phaseRow}>
                 <span style={S.phaseLabel}>{phase}</span>
                 <div style={S.track}>
                   <div style={{ ...S.bar, width: `${pPct}%` }} />
                 </div>
-                <span style={S.phaseCount}>{pUnits} units · {pGFA > 0 ? `${(pGFA/1000).toFixed(0)}k SF` : "—"}</span>
+                <span style={S.phaseCount}>{pUnit} fl · {pGFA > 0 ? `${(pGFA/1000).toFixed(0)}k SF` : "—"}</span>
               </div>
             );
           })}
@@ -288,7 +293,7 @@ const S = {
   cardVal:      { fontSize: 15, fontWeight: 700, color: "#E2E8F0", fontFamily: "monospace" },
   cardLabel:    { fontSize: 9, letterSpacing: "0.07em", textTransform: "uppercase", color: "#6B7280", marginTop: 2 },
   legend:       { display: "flex", gap: 8, padding: "10px 12px 0", flexWrap: "wrap" },
-  legendItem:   { display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#9CA3AF" },
+  legendItem:   { display: "flex", alignItems: "center", gap: 4, fontSize: 11 },
   tableWrap:    { overflowX: "auto", padding: "10px 12px 0" },
   table:        { width: "100%", borderCollapse: "collapse", fontSize: 12 },
   th:           { padding: "7px 6px", textAlign: "center", fontSize: 10, letterSpacing: "0.06em", color: "#6B7280", fontFamily: "monospace", borderBottom: "1px solid rgba(255,255,255,0.08)", fontWeight: 600 },
