@@ -4,7 +4,6 @@ import Assign    from "./components/Assign.jsx";
 import Matrix    from "./components/Matrix.jsx";
 import Visualize from "./components/Visualize.jsx";
 
-// ─── localStorage helpers ─────────────────────────────────────────────────────
 const STORAGE_KEY = "forma-affordable-v3";
 
 export function loadAllData() {
@@ -19,7 +18,6 @@ export function saveElementData(path, data) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
 }
 
-// ─── Shoelace formula — 2D polygon area in m² ────────────────────────────────
 function polygonAreaM2(ring) {
   let area = 0;
   for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
@@ -28,12 +26,13 @@ function polygonAreaM2(ring) {
   return Math.abs(area) / 2;
 }
 
-// ─── Read REAL properties from a Forma building path ─────────────────────────
+// ─── Read building data + function breakdown from Forma ───────────────────────
 async function readFormaElement(path) {
   try {
     let floors = 0, heightFt = 0, gfaSF = 0, footprintSF = 0;
+    let breakdown = []; // [{ functionId, functionName, functionColor, gfaSF }]
 
-    // Step 1: get element object
+    // Step 1: element object
     let element = null;
     try {
       const res = await Forma.elements.getByPath({ path });
@@ -66,34 +65,47 @@ async function readFormaElement(path) {
         }
         if (totalM2 > 0) gfaSF = Math.round(totalM2 * 10.764);
         if (floors === 0 && polys.length > 0) {
-          const zSet = new Set(polys.map(p => Math.round((p.elevation ?? 0) * 100)));
-          floors = Math.max(1, zSet.size);
+          floors = Math.max(1, new Set(polys.map(p => Math.round((p.elevation ?? 0) * 100))).size);
         }
       } catch (e) { console.warn("[Forma] grossFloorAreaPolygons failed", element?.urn, e); }
     }
 
-    // Step 4: areaMetrics → footprint + fallbacks
+    // Step 4: areaMetrics → footprint + GFA fallback + FUNCTION BREAKDOWN
     try {
       const result = await Forma.areaMetrics.calculate({ paths: [path] });
       const bim    = result?.builtInMetrics ?? {};
       const covM2  = bim.buildingCoverage?.value ?? 0;
       if (covM2 > 0) footprintSF = Math.round(covM2 * 10.764);
-      if (gfaSF === 0) {
-        const gfaM2 = (bim.grossFloorArea?.functionBreakdown ?? [])
-          .reduce((s, fb) => s + (fb.value ?? 0), 0);
-        if (gfaM2 > 0) gfaSF = Math.round(gfaM2 * 10.764);
-        if (floors === 0 && covM2 > 0 && gfaM2 > 0)
-          floors = Math.max(1, Math.round(gfaM2 / covM2));
+
+      // Function breakdown — one entry per function defined in Forma's floor plan editor
+      // { functionId, functionName, functionColor, value: m² }
+      const fbs = bim.grossFloorArea?.functionBreakdown ?? [];
+      breakdown = fbs
+        .filter(fb => typeof fb.value === "number" && fb.value > 0)
+        .map(fb => ({
+          functionId:    fb.functionId,
+          functionName:  fb.functionName,
+          functionColor: fb.functionColor ?? "#60A5FA",
+          gfaSF:         Math.round(fb.value * 10.764),
+        }));
+
+      // GFA fallback from breakdown sum if grossFloorAreaPolygons gave nothing
+      if (gfaSF === 0 && breakdown.length > 0) {
+        gfaSF = breakdown.reduce((s, fn) => s + fn.gfaSF, 0);
+      }
+      // Floor fallback
+      if (floors === 0 && covM2 > 0 && gfaSF > 0) {
+        floors = Math.max(1, Math.round((gfaSF / 10.764) / covM2));
       }
     } catch (e) { console.warn("[Forma] areaMetrics failed", path, e); }
 
     if (floors   === 0) floors   = 1;
     if (heightFt === 0) heightFt = floors * 10;
 
-    return { path, gfaSF, floors, heightFt, footprintSF };
+    return { path, gfaSF, floors, heightFt, footprintSF, breakdown };
   } catch (err) {
     console.warn("[Forma] readFormaElement failed", path, err);
-    return { path, gfaSF: 0, floors: 1, heightFt: 0, footprintSF: 0 };
+    return { path, gfaSF: 0, floors: 1, heightFt: 0, footprintSF: 0, breakdown: [] };
   }
 }
 
@@ -119,7 +131,6 @@ export default function App() {
     }
   }, []);
 
-  // Selection subscription
   useEffect(() => {
     let unsub;
     try {
@@ -129,7 +140,7 @@ export default function App() {
           setStatus("Click a building in Forma to begin");
           return;
         }
-        setStatus("Loading building data…");
+        setStatus("Loading…");
         const el = await readFormaElement(paths[0]);
         setSelected(el);
         setStatus(null);
@@ -144,7 +155,6 @@ export default function App() {
     return () => { if (typeof unsub === "function") unsub(); };
   }, [syncAllData]);
 
-  // Proposal subscription
   useEffect(() => {
     reloadAllBuildings();
     let unsub;
@@ -164,17 +174,11 @@ export default function App() {
     return () => { if (typeof unsub === "function") unsub(); };
   }, [reloadAllBuildings, syncAllData]);
 
-  // Tab switch — sync data; clear render colors when leaving Visualize
   useEffect(() => {
     syncAllData();
-    // When switching AWAY from Visualize, reset Forma canvas colors
-    // The Visualize component manages its own active colors;
-    // clearing here ensures other tabs always show default Forma colors
     if (activeTab !== "Visualize") {
-      try {
-        Forma.render.elementColors.clearAll();
-        Forma.render.unhideAllElements();
-      } catch { /* outside Forma */ }
+      try { Forma.render.elementColors.clearAll(); Forma.render.unhideAllElements(); }
+      catch { /* outside Forma */ }
     }
   }, [activeTab, syncAllData]);
 
@@ -190,6 +194,11 @@ export default function App() {
         {selected ? (
           <div style={S.headerSub}>
             {selected.floors} fl · {selected.gfaSF.toLocaleString()} SF · {selected.heightFt}ft
+            {selected.breakdown?.length > 0 && (
+              <span style={{ color: "#4B5563", marginLeft: 6 }}>
+                · {selected.breakdown.length} function{selected.breakdown.length !== 1 ? "s" : ""}
+              </span>
+            )}
           </div>
         ) : (
           <div style={S.headerHint}>{status}</div>
@@ -197,7 +206,7 @@ export default function App() {
       </div>
 
       <div style={S.tabBar}>
-        {TABS.map((tab) => (
+        {TABS.map(tab => (
           <button key={tab} onClick={() => setActiveTab(tab)}
             style={{ ...S.tab, ...(activeTab === tab ? S.tabActive : S.tabInactive) }}>
             {tab}
@@ -225,11 +234,22 @@ function Placeholder({ label, note }) {
 }
 
 const MOCK_BUILDINGS = [
-  { path: "/mock/bldg-001", gfaSF: 13200, floors: 6,  heightFt: 62,  footprintSF: 2200 },
-  { path: "/mock/bldg-002", gfaSF: 8500,  floors: 3,  heightFt: 32,  footprintSF: 2125 },
-  { path: "/mock/bldg-003", gfaSF: 18400, floors: 8,  heightFt: 84,  footprintSF: 2300 },
-  { path: "/mock/bldg-004", gfaSF: 6600,  floors: 3,  heightFt: 32,  footprintSF: 2200 },
-  { path: "/mock/bldg-005", gfaSF: 22000, floors: 10, heightFt: 104, footprintSF: 2200 },
+  { path: "/mock/bldg-001", gfaSF: 13200, floors: 6, heightFt: 62, footprintSF: 2200,
+    breakdown: [
+      { functionId: "res", functionName: "3 Bedroom", functionColor: "#60A5FA", gfaSF: 9900 },
+      { functionId: "cor", functionName: "Corridor",  functionColor: "#A78BFA", gfaSF: 3300 },
+    ]},
+  { path: "/mock/bldg-002", gfaSF: 8500, floors: 3, heightFt: 32, footprintSF: 2125,
+    breakdown: [
+      { functionId: "res2", functionName: "2 Bedroom", functionColor: "#34D399", gfaSF: 6800 },
+      { functionId: "cor",  functionName: "Corridor",  functionColor: "#A78BFA", gfaSF: 1700 },
+    ]},
+  { path: "/mock/bldg-003", gfaSF: 18400, floors: 8, heightFt: 84, footprintSF: 2300,
+    breakdown: [
+      { functionId: "res",  functionName: "3 Bedroom", functionColor: "#60A5FA", gfaSF: 11040 },
+      { functionId: "res2", functionName: "2 Bedroom", functionColor: "#34D399", gfaSF: 5520 },
+      { functionId: "amen", functionName: "Amenity",   functionColor: "#FB923C", gfaSF: 1840 },
+    ]},
 ];
 
 const S = {
