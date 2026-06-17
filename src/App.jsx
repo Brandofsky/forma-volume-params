@@ -10,7 +10,6 @@ export function loadAllData() {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); }
   catch { return {}; }
 }
-
 export function saveElementData(path, data) {
   const all = loadAllData();
   if (data === null) { delete all[path]; }
@@ -26,11 +25,73 @@ function polygonAreaM2(ring) {
   return Math.abs(area) / 2;
 }
 
-// ─── Read building data + function breakdown from Forma ───────────────────────
+// ─── Build per-floor function map from graphBuilding ─────────────────────────
+//
+// graphBuilding.levels[n]           → one entry per floor (bottom to top)
+//   .spaces[].id                    → space IDs present on this floor
+// graphBuilding.units[]
+//   .spaceIds[]                     → which spaces this unit occupies
+//   .properties.function            → function NAME ("3 Bedroom", "Corridor", etc.)
+//
+// To get functions on floor n:
+//   find all units whose spaceIds intersect level[n].spaces[].id
+//   → collect their properties.function values
+//
+// Returns: floorFunctions[floorIndex] = Set<functionName>
+// Also returns: unitFunctions = Map<functionName, { functionId?, functionColor? }>
+//   populated from areaMetrics.functionBreakdown for GFA data
+//
+function buildFloorFunctionMap(gb, breakdown) {
+  const levels = gb?.data?.levels ?? [];
+  const units  = gb?.data?.units  ?? [];
+
+  // Build lookup: spaceId → unit.properties.function
+  const spaceToFn = {};
+  for (const unit of units) {
+    const fn = unit.properties?.function;
+    if (!fn) continue;
+    for (const sid of (unit.spaceIds ?? [])) {
+      spaceToFn[sid] = fn;
+    }
+  }
+
+  // For each level, collect the set of function names present
+  const floorFunctions = levels.map(level => {
+    const fns = new Set();
+    for (const space of (level.spaces ?? [])) {
+      const fn = spaceToFn[space.id];
+      if (fn) fns.add(fn);
+    }
+    return fns; // Set<functionName> for this floor
+  });
+
+  // Build fn metadata map: functionName → { gfaSF, functionColor }
+  // Merge from areaMetrics breakdown (has GFA + color) with graphBuilding (has names)
+  const fnMeta = {};
+  for (const fn of breakdown) {
+    fnMeta[fn.functionName] = {
+      functionId:    fn.functionId,
+      functionColor: fn.functionColor,
+      gfaSF:         fn.gfaSF,
+    };
+  }
+  // Ensure every function from graphBuilding appears even if not in breakdown
+  for (const fns of floorFunctions) {
+    for (const name of fns) {
+      if (!fnMeta[name]) fnMeta[name] = { functionColor: "#94A3B8", gfaSF: 0 };
+    }
+  }
+
+  return { floorFunctions, fnMeta };
+}
+
+// ─── Read building data ───────────────────────────────────────────────────────
 async function readFormaElement(path) {
   try {
     let floors = 0, heightFt = 0, gfaSF = 0, footprintSF = 0;
-    let breakdown = []; // [{ functionId, functionName, functionColor, gfaSF }]
+    let breakdown = [];
+    let floorFunctions = []; // per-floor: Set<functionName>
+    let fnMeta = {};         // functionName → { functionId, functionColor, gfaSF }
 
     // Step 1: element object
     let element = null;
@@ -39,10 +100,11 @@ async function readFormaElement(path) {
       element = res?.element ?? null;
     } catch (e) { console.warn("[Forma] getByPath failed", path, e); }
 
-    // Step 2: graphBuilding → floors + height
+    // Step 2: graphBuilding → floors + height + per-floor function map
+    let gb = null;
     if (element?.representations?.graphBuilding) {
       try {
-        const gb     = await Forma.elements.representations.graphBuilding({ urn: element.urn });
+        gb = await Forma.elements.representations.graphBuilding({ urn: element.urn });
         const levels = gb?.data?.levels ?? [];
         if (levels.length > 0) {
           floors       = levels.length;
@@ -64,21 +126,18 @@ async function readFormaElement(path) {
           totalM2 += polygonAreaM2(ring);
         }
         if (totalM2 > 0) gfaSF = Math.round(totalM2 * 10.764);
-        if (floors === 0 && polys.length > 0) {
+        if (floors === 0 && polys.length > 0)
           floors = Math.max(1, new Set(polys.map(p => Math.round((p.elevation ?? 0) * 100))).size);
-        }
       } catch (e) { console.warn("[Forma] grossFloorAreaPolygons failed", element?.urn, e); }
     }
 
-    // Step 4: areaMetrics → footprint + GFA fallback + FUNCTION BREAKDOWN
+    // Step 4: areaMetrics → footprint + GFA fallback + breakdown (GFA + color per function)
     try {
       const result = await Forma.areaMetrics.calculate({ paths: [path] });
       const bim    = result?.builtInMetrics ?? {};
       const covM2  = bim.buildingCoverage?.value ?? 0;
       if (covM2 > 0) footprintSF = Math.round(covM2 * 10.764);
 
-      // Function breakdown — one entry per function defined in Forma's floor plan editor
-      // { functionId, functionName, functionColor, value: m² }
       const fbs = bim.grossFloorArea?.functionBreakdown ?? [];
       breakdown = fbs
         .filter(fb => typeof fb.value === "number" && fb.value > 0)
@@ -89,23 +148,26 @@ async function readFormaElement(path) {
           gfaSF:         Math.round(fb.value * 10.764),
         }));
 
-      // GFA fallback from breakdown sum if grossFloorAreaPolygons gave nothing
-      if (gfaSF === 0 && breakdown.length > 0) {
+      if (gfaSF === 0 && breakdown.length > 0)
         gfaSF = breakdown.reduce((s, fn) => s + fn.gfaSF, 0);
-      }
-      // Floor fallback
-      if (floors === 0 && covM2 > 0 && gfaSF > 0) {
+      if (floors === 0 && covM2 > 0 && gfaSF > 0)
         floors = Math.max(1, Math.round((gfaSF / 10.764) / covM2));
-      }
     } catch (e) { console.warn("[Forma] areaMetrics failed", path, e); }
+
+    // Step 5: build per-floor function map (needs both graphBuilding + breakdown)
+    if (gb) {
+      const result = buildFloorFunctionMap(gb, breakdown);
+      floorFunctions = result.floorFunctions;
+      fnMeta         = result.fnMeta;
+    }
 
     if (floors   === 0) floors   = 1;
     if (heightFt === 0) heightFt = floors * 10;
 
-    return { path, gfaSF, floors, heightFt, footprintSF, breakdown };
+    return { path, gfaSF, floors, heightFt, footprintSF, breakdown, floorFunctions, fnMeta };
   } catch (err) {
     console.warn("[Forma] readFormaElement failed", path, err);
-    return { path, gfaSF: 0, floors: 1, heightFt: 0, footprintSF: 0, breakdown: [] };
+    return { path, gfaSF: 0, floors: 1, heightFt: 0, footprintSF: 0, breakdown: [], floorFunctions: [], fnMeta: {} };
   }
 }
 
@@ -187,6 +249,8 @@ export default function App() {
     syncAllData();
   }
 
+  const fnCount = selected?.breakdown?.length ?? 0;
+
   return (
     <div style={S.root}>
       <div style={S.header}>
@@ -194,11 +258,7 @@ export default function App() {
         {selected ? (
           <div style={S.headerSub}>
             {selected.floors} fl · {selected.gfaSF.toLocaleString()} SF · {selected.heightFt}ft
-            {selected.breakdown?.length > 0 && (
-              <span style={{ color: "#4B5563", marginLeft: 6 }}>
-                · {selected.breakdown.length} function{selected.breakdown.length !== 1 ? "s" : ""}
-              </span>
-            )}
+            {fnCount > 0 && <span style={{ color: "#4B5563", marginLeft: 5 }}>· {fnCount} fn</span>}
           </div>
         ) : (
           <div style={S.headerHint}>{status}</div>
@@ -233,23 +293,46 @@ function Placeholder({ label, note }) {
   );
 }
 
+// Mock data with realistic floorFunctions (non-typical: ground floor = amenity)
 const MOCK_BUILDINGS = [
-  { path: "/mock/bldg-001", gfaSF: 13200, floors: 6, heightFt: 62, footprintSF: 2200,
+  {
+    path: "/mock/bldg-001", gfaSF: 13200, floors: 6, heightFt: 62, footprintSF: 2200,
     breakdown: [
-      { functionId: "res", functionName: "3 Bedroom", functionColor: "#60A5FA", gfaSF: 9900 },
-      { functionId: "cor", functionName: "Corridor",  functionColor: "#A78BFA", gfaSF: 3300 },
-    ]},
-  { path: "/mock/bldg-002", gfaSF: 8500, floors: 3, heightFt: 32, footprintSF: 2125,
+      { functionId: "3bed", functionName: "3 Bedroom", functionColor: "#60A5FA", gfaSF: 9240 },
+      { functionId: "corr", functionName: "Corridor",  functionColor: "#A78BFA", gfaSF: 2200 },
+      { functionId: "amen", functionName: "Amenity",   functionColor: "#FB923C", gfaSF: 1760 },
+    ],
+    // Floor 1 = Amenity + Corridor, Floors 2-6 = 3 Bedroom + Corridor
+    floorFunctions: [
+      new Set(["Amenity", "Corridor"]),
+      new Set(["3 Bedroom", "Corridor"]),
+      new Set(["3 Bedroom", "Corridor"]),
+      new Set(["3 Bedroom", "Corridor"]),
+      new Set(["3 Bedroom", "Corridor"]),
+      new Set(["3 Bedroom", "Corridor"]),
+    ],
+    fnMeta: {
+      "3 Bedroom": { functionColor: "#60A5FA", gfaSF: 9240 },
+      "Corridor":  { functionColor: "#A78BFA", gfaSF: 2200 },
+      "Amenity":   { functionColor: "#FB923C", gfaSF: 1760 },
+    },
+  },
+  {
+    path: "/mock/bldg-002", gfaSF: 8500, floors: 3, heightFt: 32, footprintSF: 2125,
     breakdown: [
-      { functionId: "res2", functionName: "2 Bedroom", functionColor: "#34D399", gfaSF: 6800 },
-      { functionId: "cor",  functionName: "Corridor",  functionColor: "#A78BFA", gfaSF: 1700 },
-    ]},
-  { path: "/mock/bldg-003", gfaSF: 18400, floors: 8, heightFt: 84, footprintSF: 2300,
-    breakdown: [
-      { functionId: "res",  functionName: "3 Bedroom", functionColor: "#60A5FA", gfaSF: 11040 },
-      { functionId: "res2", functionName: "2 Bedroom", functionColor: "#34D399", gfaSF: 5520 },
-      { functionId: "amen", functionName: "Amenity",   functionColor: "#FB923C", gfaSF: 1840 },
-    ]},
+      { functionId: "2bed", functionName: "2 Bedroom", functionColor: "#34D399", gfaSF: 6800 },
+      { functionId: "corr", functionName: "Corridor",  functionColor: "#A78BFA", gfaSF: 1700 },
+    ],
+    floorFunctions: [
+      new Set(["2 Bedroom", "Corridor"]),
+      new Set(["2 Bedroom", "Corridor"]),
+      new Set(["2 Bedroom", "Corridor"]),
+    ],
+    fnMeta: {
+      "2 Bedroom": { functionColor: "#34D399", gfaSF: 6800 },
+      "Corridor":  { functionColor: "#A78BFA", gfaSF: 1700 },
+    },
+  },
 ];
 
 const S = {
