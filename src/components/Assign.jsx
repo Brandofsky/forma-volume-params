@@ -1,134 +1,154 @@
 import { useState, useEffect } from "react";
 import { Forma } from "forma-embedded-view-sdk/auto";
 
-const FUNCTIONS    = ["3 Bedroom", "2 Bedroom", "1 Bedroom", "Core", "Corridor", "Amenity"];
-const PHASES       = ["Phase 1", "Phase 2", "Phase 3", "Phase 4"];
-const COST_DEFAULT = { "3 Bedroom": 220, "2 Bedroom": 200, "1 Bedroom": 185, "Core": 95, "Corridor": 80, "Amenity": 160 };
+// ─── Constants ────────────────────────────────────────────────────────────────
+const PHASES = ["Phase 1", "Phase 2", "Phase 3", "Phase 4"];
 
-function emptyForm() {
-  return { sector: "Affordable Housing", function: "", costPerSF: "", phase: "Phase 1", withinSite: false };
+// Default cost suggestions per function name (fallback if name matches)
+const COST_SUGGESTIONS = {
+  "3 bedroom": 220, "3bed": 220, "3br": 220,
+  "2 bedroom": 200, "2bed": 200, "2br": 200,
+  "1 bedroom": 185, "1bed": 185, "1br": 185,
+  "studio":    170,
+  "core":       95, "stair": 95, "elevator": 95,
+  "corridor":   80, "hallway": 80, "circulation": 80,
+  "amenity":   160, "retail": 175, "commercial": 175,
+};
+
+function suggestCost(name = "") {
+  const key = name.toLowerCase().trim();
+  for (const [k, v] of Object.entries(COST_SUGGESTIONS)) {
+    if (key.includes(k)) return String(v);
+  }
+  return "";
 }
 
-// ── Sync our function name to Forma's native Function field ───────────────────
-//
-// Verified correct flow using SDK type definitions:
-//
-// 1. Forma.settings.get()
-//    → { buildingFunctions: BuildingFunction[] }  each has { id, name, color }
-//    → built-in IDs: "residential", "commercial", "unspecified"
-//
-// 2. Forma.settings.buildingFunctions.add({ name })  (if not already there)
-//    → returns { buildingFunctions } with the new entry including its id
-//
-// 3. Forma.integrateElements.updateElementV2({ urn, properties: { functionId } })
-//    → properties is PartialNullish<Properties> from forma-elements
-//    → Properties.functionId is the NATIVE field shown in Forma's right panel
-//    → returns { urn: newUrn }
-//
-// 4. Forma.proposal.replaceElement({ path, urn: newUrn })
-//    → commits the updated element into the proposal → visible in Forma UI
-//
-async function syncFunctionToForma(path, elementUrn, fnName) {
-  // Step 1+2: get or create the Forma building function
-  const { buildingFunctions } = await Forma.settings.get();
-
-  let match = buildingFunctions.find(
-    (f) => f.name.toLowerCase() === fnName.toLowerCase()
-  );
-  if (!match) {
-    const res = await Forma.settings.buildingFunctions.add({ name: fnName });
-    match = res.buildingFunctions.find(
-      (f) => f.name.toLowerCase() === fnName.toLowerCase()
-    );
+// ─── Read function breakdown from Forma areaMetrics ───────────────────────────
+// Returns: [{ functionId, functionName, functionColor, gfaM2, gfaSF }]
+// Uses areaMetrics.grossFloorArea.functionBreakdown — already split per function by Forma
+async function readFunctionBreakdown(path) {
+  try {
+    const result = await Forma.areaMetrics.calculate({ paths: [path] });
+    const breakdown = result?.builtInMetrics?.grossFloorArea?.functionBreakdown ?? [];
+    return breakdown
+      .filter(fb => typeof fb.value === "number" && fb.value > 0)
+      .map(fb => ({
+        functionId:    fb.functionId,
+        functionName:  fb.functionName,
+        functionColor: fb.functionColor ?? "#60A5FA",
+        gfaM2:         fb.value,
+        gfaSF:         Math.round(fb.value * 10.764),
+      }));
+  } catch (e) {
+    console.warn("[Forma] readFunctionBreakdown failed", e);
+    return [];
   }
-  if (!match) throw new Error(`Could not find or create function "${fnName}"`);
+}
 
-  // Step 3: update element with native functionId via integrateElements
-  const { urn: newUrn } = await Forma.integrateElements.updateElementV2({
-    urn: elementUrn,
-    properties: {
-      functionId: match.id,   // this is the native field Forma's panel reads
-    },
-  });
-
-  // Step 4: replace the element in the proposal to make it visible
-  await Forma.proposal.replaceElement({ path, urn: newUrn });
+// ─── Data shape ───────────────────────────────────────────────────────────────
+// Stored per building path in localStorage:
+// {
+//   withinSite: boolean,
+//   phase: "Phase 1" | ...,
+//   functions: {
+//     [functionId]: { costPerSF: string }
+//   }
+// }
+function emptyBuildingData() {
+  return { withinSite: false, phase: "Phase 1", functions: {} };
 }
 
 export default function Assign({ selected, allData, onSave }) {
-  const [form,       setForm]       = useState(emptyForm());
+  const [breakdown,  setBreakdown]  = useState([]);   // from Forma areaMetrics
+  const [form,       setForm]       = useState(emptyBuildingData());
+  const [loading,    setLoading]    = useState(false);
   const [toast,      setToast]      = useState(null);
-  const [syncing,    setSyncing]    = useState(false);
-  const [elementUrn, setElementUrn] = useState(null);
 
-  // When selected building changes → load saved data + fetch element URN
+  // When selected building changes → load saved data + fetch live function breakdown
   useEffect(() => {
-    if (!selected) return;
-    const saved = allData[selected.path];
-    setForm(saved ? { ...emptyForm(), ...saved } : emptyForm());
+    if (!selected) { setBreakdown([]); setForm(emptyBuildingData()); return; }
 
-    Forma.elements.getByPath({ path: selected.path })
-      .then((res) => setElementUrn(res?.element?.urn ?? null))
-      .catch(() => setElementUrn(null));
+    const saved = allData[selected.path];
+    setForm(saved ? { ...emptyBuildingData(), ...saved } : emptyBuildingData());
+
+    // Fetch live function breakdown from Forma
+    setLoading(true);
+    readFunctionBreakdown(selected.path).then(fns => {
+      setBreakdown(fns);
+
+      // Auto-populate cost suggestions for any function not yet saved
+      if (fns.length > 0) {
+        setForm(prev => {
+          const updated = { ...prev };
+          for (const fn of fns) {
+            if (!updated.functions[fn.functionId]?.costPerSF) {
+              const suggestion = suggestCost(fn.functionName);
+              if (suggestion) {
+                updated.functions = {
+                  ...updated.functions,
+                  [fn.functionId]: { costPerSF: suggestion },
+                };
+              }
+            }
+          }
+          return updated;
+        });
+      }
+      setLoading(false);
+    });
   }, [selected?.path]);
 
-  function handleChange(key, val) {
-    setForm((prev) => {
-      const next = { ...prev, [key]: val };
-      if (key === "function" && !allData[selected?.path]?.costPerSF) {
-        next.costPerSF = COST_DEFAULT[val] || "";
-      }
-      return next;
-    });
+  function handleCostChange(functionId, costPerSF) {
+    setForm(prev => ({
+      ...prev,
+      functions: { ...prev.functions, [functionId]: { costPerSF } },
+    }));
   }
 
-  async function handleSave() {
+  function handlePhase(phase) {
+    setForm(prev => ({ ...prev, phase }));
+  }
+
+  function handleToggleSite() {
+    setForm(prev => ({ ...prev, withinSite: !prev.withinSite }));
+  }
+
+  function handleSave() {
     if (!selected) return;
-    if (!form.function) { showToast("⚠ Select a function first"); return; }
-
-    // 1. Save to localStorage immediately so Matrix updates right away
     onSave(selected.path, form);
-
-    // 2. Sync to Forma's native Function field
-    if (elementUrn) {
-      setSyncing(true);
-      showToast("Syncing to Forma…");
-      try {
-        await syncFunctionToForma(selected.path, elementUrn, form.function);
-        showToast("Saved ✓  (synced to Forma)");
-      } catch (e) {
-        console.warn("[Forma] syncFunctionToForma failed:", e);
-        showToast("Saved ✓  (Forma sync failed)");
-      } finally {
-        setSyncing(false);
-      }
-    } else {
-      showToast("Saved ✓");
-    }
+    showToast("Saved ✓");
   }
 
   function handleClear() {
     if (!selected) return;
     onSave(selected.path, null);
-    setForm(emptyForm());
+    setForm(emptyBuildingData());
     showToast("Cleared");
   }
 
   function showToast(msg) {
     setToast(msg);
-    setTimeout(() => setToast(null), 2500);
+    setTimeout(() => setToast(null), 2000);
   }
 
-  const costPerSF = parseFloat(form.costPerSF) || 0;
-  const totalCost = selected ? selected.gfaSF * costPerSF : 0;
-  const isSaved   = selected && !!allData[selected.path]?.function;
+  // ── Derived totals ────────────────────────────────────────────────────────
+  const totalGFASF = breakdown.reduce((s, fn) => s + fn.gfaSF, 0);
+  const totalCost  = breakdown.reduce((s, fn) => {
+    const cost = parseFloat(form.functions[fn.functionId]?.costPerSF) || 0;
+    return s + fn.gfaSF * cost;
+  }, 0);
+  const isSaved = selected && !!allData[selected.path];
 
+  // ── No selection ─────────────────────────────────────────────────────────
   if (!selected) {
     return (
       <div style={S.empty}>
         <div style={S.emptyIcon}>⬡</div>
         <div style={S.emptyTitle}>No building selected</div>
-        <div style={S.emptyNote}>Click any building in the Forma canvas to assign parameters</div>
+        <div style={S.emptyNote}>
+          Click any building in Forma, then assign functions to its floors
+          using the floor plan editor on the right panel before coming here.
+        </div>
       </div>
     );
   }
@@ -136,13 +156,13 @@ export default function Assign({ selected, allData, onSave }) {
   return (
     <div style={S.root}>
 
-      {/* Live building stats */}
+      {/* Building stats */}
       <div style={S.statsCard}>
         <div style={S.statsLabel}>Live from Forma</div>
         <div style={S.statsGrid}>
           <Stat label="Floors"    value={selected.floors} />
-          <Stat label="Total GFA" value={`${selected.gfaSF.toLocaleString()} SF`} />
-          <Stat label="Per Floor" value={`${selected.footprintSF.toLocaleString()} SF`} />
+          <Stat label="Total GFA" value={totalGFASF > 0 ? `${totalGFASF.toLocaleString()} SF` : `${selected.gfaSF.toLocaleString()} SF`} />
+          <Stat label="Footprint" value={`${selected.footprintSF.toLocaleString()} SF`} />
           <Stat label="Height"    value={`${selected.heightFt} ft`} />
         </div>
         <div style={S.pathLabel}>{selected.path.split("/").pop()}</div>
@@ -150,46 +170,90 @@ export default function Assign({ selected, allData, onSave }) {
 
       <div style={S.form}>
 
-        {/* Function picker */}
-        <Field
-          label="Function"
-          hint={syncing ? "syncing…" : elementUrn ? "syncs to Forma panel ↗" : ""}
-        >
-          <div style={S.fnGrid}>
-            {FUNCTIONS.map((fn) => (
-              <button
-                key={fn}
-                onClick={() => handleChange("function", fn)}
-                style={{ ...S.fnBtn, ...(form.function === fn ? S.fnActive : {}) }}
-              >
-                {fn}
-              </button>
-            ))}
-          </div>
+        {/* Function breakdown from Forma — one row per function */}
+        <Field label="Functions from Forma">
+          {loading && (
+            <div style={S.loadingNote}>Reading floor functions…</div>
+          )}
+
+          {!loading && breakdown.length === 0 && (
+            <div style={S.noFunctions}>
+              <div style={{ fontSize: 12, color: "#4B5563", lineHeight: 1.6 }}>
+                No functions detected on this building.
+              </div>
+              <div style={{ fontSize: 11, color: "#374151", marginTop: 4 }}>
+                In Forma's right panel → Building → Floor Plans → assign functions to floors, then return here.
+              </div>
+            </div>
+          )}
+
+          {!loading && breakdown.length > 0 && (
+            <div style={S.fnList}>
+              {breakdown.map(fn => {
+                const costStr = form.functions[fn.functionId]?.costPerSF ?? "";
+                const cost    = parseFloat(costStr) || 0;
+                const subtotal = fn.gfaSF * cost;
+                const pct     = totalGFASF > 0 ? Math.round((fn.gfaSF / totalGFASF) * 100) : 0;
+
+                return (
+                  <div key={fn.functionId} style={S.fnRow}>
+                    {/* Function header */}
+                    <div style={S.fnHeader}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                        <div style={{ width: 8, height: 8, borderRadius: "50%", background: fn.functionColor, flexShrink: 0 }} />
+                        <span style={S.fnName}>{fn.functionName}</span>
+                      </div>
+                      <span style={S.fnGfa}>
+                        {fn.gfaSF.toLocaleString()} SF
+                        <span style={{ color: "#4B5563", marginLeft: 4 }}>({pct}%)</span>
+                      </span>
+                    </div>
+
+                    {/* GFA bar */}
+                    <div style={S.fnBar}>
+                      <div style={{ ...S.fnBarFill, width: `${pct}%`, background: fn.functionColor }} />
+                    </div>
+
+                    {/* Cost input */}
+                    <div style={S.fnCostRow}>
+                      <span style={S.costLabel}>Cost / SF</span>
+                      <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                        <span style={S.prefix}>$</span>
+                        <input
+                          type="number"
+                          value={costStr}
+                          onChange={e => handleCostChange(fn.functionId, e.target.value)}
+                          placeholder="0"
+                          style={S.costInput}
+                        />
+                        <span style={S.suffix}>/SF</span>
+                      </div>
+                      {subtotal > 0 && (
+                        <span style={S.subtotal}>${Math.round(subtotal).toLocaleString()}</span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+
+              {/* Total cost row */}
+              {totalCost > 0 && (
+                <div style={S.totalRow}>
+                  <span style={S.totalLabel}>Total Cost</span>
+                  <span style={S.totalVal}>${Math.round(totalCost).toLocaleString()}</span>
+                </div>
+              )}
+            </div>
+          )}
         </Field>
 
-        {/* Cost / SF */}
-        <Field label="Cost / SF" hint="auto-suggested">
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={S.prefix}>$</span>
-            <input
-              type="number"
-              value={form.costPerSF}
-              onChange={(e) => handleChange("costPerSF", e.target.value)}
-              placeholder="0"
-              style={{ ...S.input, flex: 1 }}
-            />
-            <span style={S.suffix}>/SF</span>
-          </div>
-        </Field>
-
-        {/* Phase */}
+        {/* Phase — applies to whole building */}
         <Field label="Phase">
           <div style={{ display: "flex", gap: 5 }}>
-            {PHASES.map((p) => (
+            {PHASES.map(p => (
               <button
                 key={p}
-                onClick={() => handleChange("phase", p)}
+                onClick={() => handlePhase(p)}
                 style={{ ...S.phaseBtn, ...(form.phase === p ? S.phaseActive : {}) }}
               >
                 {p.replace("Phase ", "P")}
@@ -200,7 +264,7 @@ export default function Assign({ selected, allData, onSave }) {
 
         {/* Within site */}
         <Field label="Within Site Limit">
-          <div onClick={() => handleChange("withinSite", !form.withinSite)} style={S.toggleRow}>
+          <div onClick={handleToggleSite} style={S.toggleRow}>
             <div style={{ ...S.track, background: form.withinSite ? "#22C55E" : "#374151" }}>
               <div style={{ ...S.thumb, transform: form.withinSite ? "translateX(18px)" : "translateX(2px)" }} />
             </div>
@@ -210,47 +274,16 @@ export default function Assign({ selected, allData, onSave }) {
           </div>
         </Field>
 
-        {/* Cost summary */}
-        {form.function && costPerSF > 0 && (
-          <div style={S.costCard}>
-            <div style={S.costRow}>
-              <span style={S.costKey}>GFA from Forma</span>
-              <span style={S.costVal}>{selected.gfaSF.toLocaleString()} SF</span>
-            </div>
-            <div style={S.costRow}>
-              <span style={S.costKey}>Cost / SF</span>
-              <span style={S.costVal}>${costPerSF}</span>
-            </div>
-            <div style={{ ...S.costRow, borderTop: "1px solid rgba(255,255,255,0.07)", paddingTop: 8, marginTop: 4 }}>
-              <span style={S.costKey}>Total Cost</span>
-              <span style={{ ...S.costVal, color: "#34D399", fontWeight: 700 }}>
-                ${Math.round(totalCost).toLocaleString()}
-              </span>
-            </div>
-          </div>
-        )}
-
         {/* Actions */}
         <div style={{ display: "flex", gap: 8 }}>
-          <button
-            onClick={handleSave}
-            disabled={syncing}
-            style={{ ...S.saveBtn, opacity: syncing ? 0.7 : 1 }}
-          >
-            {syncing ? "Syncing to Forma…" : "Save to Element"}
-          </button>
-          {isSaved && (
-            <button onClick={handleClear} style={S.clearBtn}>Clear</button>
-          )}
+          <button onClick={handleSave} style={S.saveBtn}>Save to Element</button>
+          {isSaved && <button onClick={handleClear} style={S.clearBtn}>Clear</button>}
         </div>
 
-        {/* Saved badge */}
         {isSaved && (
           <div style={S.savedBadge}>
             <span style={{ color: "#34D399" }}>✓</span> Parameters saved
-            {allData[selected.path]?.withinSite && (
-              <span style={S.inSiteTag}>IN SITE</span>
-            )}
+            {form.withinSite && <span style={S.inSiteTag}>IN SITE</span>}
           </div>
         )}
       </div>
@@ -260,15 +293,12 @@ export default function Assign({ selected, allData, onSave }) {
   );
 }
 
-function Field({ label, hint, children }) {
+function Field({ label, children }) {
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-        <span style={{ fontSize: 10, letterSpacing: "0.07em", textTransform: "uppercase", color: "#9CA3AF", fontFamily: "monospace" }}>
-          {label}
-        </span>
-        {hint && <span style={{ fontSize: 10, color: "#4B5563", fontStyle: "italic" }}>{hint}</span>}
-      </div>
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <span style={{ fontSize: 10, letterSpacing: "0.07em", textTransform: "uppercase", color: "#9CA3AF", fontFamily: "monospace" }}>
+        {label}
+      </span>
       {children}
     </div>
   );
@@ -284,34 +314,42 @@ function Stat({ label, value }) {
 }
 
 const S = {
-  root:       { display: "flex", flexDirection: "column" },
-  empty:      { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "60vh", gap: 10, padding: 24, textAlign: "center" },
-  emptyIcon:  { fontSize: 32, opacity: 0.15 },
-  emptyTitle: { fontSize: 14, fontWeight: 700, color: "#E2E8F0", opacity: 0.3 },
-  emptyNote:  { fontSize: 12, color: "#4B5563", lineHeight: 1.6 },
-  statsCard:  { margin: "12px 14px 0", background: "rgba(96,165,250,0.07)", border: "1px solid rgba(96,165,250,0.2)", borderRadius: 8, padding: "10px 12px" },
-  statsLabel: { fontSize: 9, letterSpacing: "0.09em", textTransform: "uppercase", color: "#60A5FA", fontFamily: "monospace", marginBottom: 10 },
-  statsGrid:  { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 4 },
-  pathLabel:  { fontSize: 9, color: "#374151", fontFamily: "monospace", marginTop: 8, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-  form:       { padding: "12px 14px 24px", display: "flex", flexDirection: "column", gap: 14 },
-  fnGrid:     { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 5 },
-  fnBtn:      { padding: "7px 4px", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 5, background: "rgba(255,255,255,0.03)", color: "#9CA3AF", fontSize: 11, cursor: "pointer", transition: "all 0.12s" },
-  fnActive:   { background: "rgba(96,165,250,0.15)", border: "1px solid rgba(96,165,250,0.4)", color: "#60A5FA", fontWeight: 600 },
-  input:      { background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 5, color: "#E2E8F0", fontSize: 13, padding: "7px 10px", outline: "none", fontFamily: "Inter, sans-serif", boxSizing: "border-box" },
-  prefix:     { color: "#6B7280", fontSize: 13 },
-  suffix:     { color: "#6B7280", fontSize: 11 },
-  phaseBtn:   { flex: 1, padding: "6px 0", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 5, background: "rgba(255,255,255,0.03)", color: "#9CA3AF", fontSize: 11, cursor: "pointer", transition: "all 0.12s" },
-  phaseActive:{ background: "rgba(251,191,36,0.12)", border: "1px solid rgba(251,191,36,0.35)", color: "#FBBF24", fontWeight: 600 },
-  toggleRow:  { display: "flex", alignItems: "center", gap: 10, cursor: "pointer" },
-  track:      { width: 38, height: 22, borderRadius: 11, position: "relative", transition: "background 0.2s", flexShrink: 0 },
-  thumb:      { position: "absolute", top: 3, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "transform 0.2s" },
-  costCard:   { background: "rgba(0,0,0,0.25)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 7, padding: "10px 12px", display: "flex", flexDirection: "column", gap: 6 },
-  costRow:    { display: "flex", justifyContent: "space-between" },
-  costKey:    { fontSize: 11, color: "#6B7280" },
-  costVal:    { fontSize: 11, color: "#E2E8F0", fontFamily: "monospace" },
-  saveBtn:    { flex: 1, background: "linear-gradient(135deg,#2563EB,#1D4ED8)", border: "none", borderRadius: 6, color: "#fff", fontSize: 13, fontWeight: 600, padding: "10px 0", cursor: "pointer" },
-  clearBtn:   { padding: "10px 14px", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 6, color: "#6B7280", fontSize: 12, cursor: "pointer" },
-  savedBadge: { display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: "#6B7280", padding: "6px 10px", background: "rgba(52,211,153,0.06)", border: "1px solid rgba(52,211,153,0.15)", borderRadius: 6 },
-  inSiteTag:  { marginLeft: "auto", fontSize: 9, color: "#34D399", border: "1px solid rgba(52,211,153,0.3)", borderRadius: 3, padding: "1px 5px", fontFamily: "monospace", letterSpacing: "0.07em" },
-  toast:      { position: "fixed", bottom: 16, left: "50%", transform: "translateX(-50%)", background: "#1E293B", border: "1px solid rgba(96,165,250,0.3)", color: "#60A5FA", borderRadius: 7, padding: "8px 18px", fontSize: 12, fontWeight: 600, fontFamily: "monospace", boxShadow: "0 4px 20px rgba(0,0,0,0.5)", whiteSpace: "nowrap" },
+  root:        { display: "flex", flexDirection: "column" },
+  empty:       { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "60vh", gap: 10, padding: 24, textAlign: "center" },
+  emptyIcon:   { fontSize: 32, opacity: 0.15 },
+  emptyTitle:  { fontSize: 14, fontWeight: 700, color: "#E2E8F0", opacity: 0.3 },
+  emptyNote:   { fontSize: 12, color: "#4B5563", lineHeight: 1.6 },
+  statsCard:   { margin: "12px 14px 0", background: "rgba(96,165,250,0.07)", border: "1px solid rgba(96,165,250,0.2)", borderRadius: 8, padding: "10px 12px" },
+  statsLabel:  { fontSize: 9, letterSpacing: "0.09em", textTransform: "uppercase", color: "#60A5FA", fontFamily: "monospace", marginBottom: 10 },
+  statsGrid:   { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 4 },
+  pathLabel:   { fontSize: 9, color: "#374151", fontFamily: "monospace", marginTop: 8, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  form:        { padding: "12px 14px 24px", display: "flex", flexDirection: "column", gap: 16 },
+  loadingNote: { fontSize: 11, color: "#4B5563", fontStyle: "italic", padding: "8px 0" },
+  noFunctions: { background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 7, padding: "12px 14px" },
+  fnList:      { display: "flex", flexDirection: "column", gap: 10 },
+  fnRow:       { background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 8, padding: "10px 12px", display: "flex", flexDirection: "column", gap: 7 },
+  fnHeader:    { display: "flex", justifyContent: "space-between", alignItems: "center" },
+  fnName:      { fontSize: 12, fontWeight: 600, color: "#E2E8F0" },
+  fnGfa:       { fontSize: 11, color: "#9CA3AF", fontFamily: "monospace" },
+  fnBar:       { height: 3, background: "rgba(255,255,255,0.06)", borderRadius: 2 },
+  fnBarFill:   { height: "100%", borderRadius: 2, opacity: 0.6, transition: "width 0.3s" },
+  fnCostRow:   { display: "flex", alignItems: "center", gap: 8 },
+  costLabel:   { fontSize: 10, color: "#6B7280", width: 46, flexShrink: 0 },
+  costInput:   { background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 5, color: "#E2E8F0", fontSize: 12, padding: "5px 8px", outline: "none", width: 60, fontFamily: "monospace" },
+  prefix:      { color: "#6B7280", fontSize: 12 },
+  suffix:      { color: "#6B7280", fontSize: 10 },
+  subtotal:    { marginLeft: "auto", fontSize: 11, color: "#34D399", fontFamily: "monospace", fontWeight: 600 },
+  totalRow:    { display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: "1px solid rgba(255,255,255,0.07)", paddingTop: 10, marginTop: 2 },
+  totalLabel:  { fontSize: 11, color: "#9CA3AF" },
+  totalVal:    { fontSize: 13, fontWeight: 700, color: "#34D399", fontFamily: "monospace" },
+  phaseBtn:    { flex: 1, padding: "6px 0", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 5, background: "rgba(255,255,255,0.03)", color: "#9CA3AF", fontSize: 11, cursor: "pointer", transition: "all 0.12s" },
+  phaseActive: { background: "rgba(251,191,36,0.12)", border: "1px solid rgba(251,191,36,0.35)", color: "#FBBF24", fontWeight: 600 },
+  toggleRow:   { display: "flex", alignItems: "center", gap: 10, cursor: "pointer" },
+  track:       { width: 38, height: 22, borderRadius: 11, position: "relative", transition: "background 0.2s", flexShrink: 0 },
+  thumb:       { position: "absolute", top: 3, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "transform 0.2s" },
+  saveBtn:     { flex: 1, background: "linear-gradient(135deg,#2563EB,#1D4ED8)", border: "none", borderRadius: 6, color: "#fff", fontSize: 13, fontWeight: 600, padding: "10px 0", cursor: "pointer" },
+  clearBtn:    { padding: "10px 14px", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 6, color: "#6B7280", fontSize: 12, cursor: "pointer" },
+  savedBadge:  { display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: "#6B7280", padding: "6px 10px", background: "rgba(52,211,153,0.06)", border: "1px solid rgba(52,211,153,0.15)", borderRadius: 6 },
+  inSiteTag:   { marginLeft: "auto", fontSize: 9, color: "#34D399", border: "1px solid rgba(52,211,153,0.3)", borderRadius: 3, padding: "1px 5px", fontFamily: "monospace", letterSpacing: "0.07em" },
+  toast:       { position: "fixed", bottom: 16, left: "50%", transform: "translateX(-50%)", background: "#1E293B", border: "1px solid rgba(96,165,250,0.3)", color: "#60A5FA", borderRadius: 7, padding: "8px 18px", fontSize: 12, fontWeight: 600, fontFamily: "monospace", boxShadow: "0 4px 20px rgba(0,0,0,0.5)", whiteSpace: "nowrap" },
 };

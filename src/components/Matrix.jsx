@@ -1,21 +1,25 @@
-// Unit functions — only these count toward "Total Units" in the matrix
-const UNIT_FUNCTIONS    = ["3 Bedroom", "2 Bedroom", "1 Bedroom"];
-// Support functions — shown in matrix but NOT counted as units
-const SUPPORT_FUNCTIONS = ["Core", "Corridor", "Amenity"];
-const ALL_FUNCTIONS     = [...UNIT_FUNCTIONS, ...SUPPORT_FUNCTIONS];
+// Matrix logic with new data shape:
+// allData[path] = { withinSite, phase, functions: { [functionId]: { costPerSF } } }
+// allBuildings[n] = { path, floors, gfaSF, heightFt, footprintSF,
+//                     breakdown: [{ functionId, functionName, functionColor, gfaSF }] }
+//
+// NOTE: breakdown is now read from areaMetrics in App.jsx and passed through allBuildings
+// So each building already has per-function GFA — no need to guess or divide by floors.
+//
+// Matrix rows = floors (1 to maxFloor)
+// Matrix cols = unique functions across all site buildings
+// Cell value  = number of buildings that have that function AND have floors >= row
 
-const FN_SHORT = {
-  "3 Bedroom": "3 Bed", "2 Bedroom": "2 Bed", "1 Bedroom": "1 Bed",
-  "Core": "Core", "Corridor": "Corr", "Amenity": "Amen",
-};
-const FN_COLOR = {
-  "3 Bedroom": "#60A5FA", "2 Bedroom": "#34D399", "1 Bedroom": "#FBBF24",
-  "Core": "#F87171", "Corridor": "#A78BFA", "Amenity": "#FB923C",
-};
+const UNIT_FUNCTION_KEYWORDS = ["bedroom", "bed", "br", "studio", "unit", "residential", "apartment"];
+
+function isUnitFunction(name = "") {
+  const lower = name.toLowerCase();
+  return UNIT_FUNCTION_KEYWORDS.some(k => lower.includes(k));
+}
 
 export default function Matrix({ allBuildings, allData }) {
 
-  const siteBuildings = allBuildings.filter((b) => allData[b.path]?.withinSite);
+  const siteBuildings = allBuildings.filter(b => allData[b.path]?.withinSite);
 
   if (siteBuildings.length === 0) {
     return (
@@ -29,53 +33,83 @@ export default function Matrix({ allBuildings, allData }) {
     );
   }
 
-  // Only show functions that are actually assigned to at least one site building
-  const usedFns = ALL_FUNCTIONS.filter((fn) =>
-    siteBuildings.some((b) => allData[b.path]?.function === fn)
-  );
+  // Collect all unique functions across site buildings (from breakdown)
+  const fnMap = {}; // functionId → { functionName, functionColor }
+  for (const b of siteBuildings) {
+    for (const fn of (b.breakdown ?? [])) {
+      if (!fnMap[fn.functionId]) {
+        fnMap[fn.functionId] = { functionName: fn.functionName, functionColor: fn.functionColor };
+      }
+    }
+  }
+  const allFnIds = Object.keys(fnMap);
 
-  const maxFloor = Math.max(...siteBuildings.map((b) => b.floors));
+  if (allFnIds.length === 0) {
+    return (
+      <div style={S.empty}>
+        <div style={S.emptyIcon}>◎</div>
+        <div style={S.emptyTitle}>No functions assigned</div>
+        <div style={S.emptyNote}>
+          In Forma's right panel, open Building → Floor Plans and assign functions to floors, then come back here.
+        </div>
+      </div>
+    );
+  }
 
-  // ── Matrix cell: buildings of that function reaching that floor ───────────
+  const unitFnIds    = allFnIds.filter(id => isUnitFunction(fnMap[id].functionName));
+  const supportFnIds = allFnIds.filter(id => !isUnitFunction(fnMap[id].functionName));
+  const maxFloor     = Math.max(...siteBuildings.map(b => b.floors));
+
+  // ── Matrix cell: buildings with this function present on this floor ───────
+  // A building "has a function on floor f" if:
+  //   - it has that function in its breakdown (meaning at least 1 floor uses it)
+  //   - AND its total floor count >= f
+  // (We don't have per-floor breakdown from areaMetrics, only total GFA per function)
   const matrix = {};
   for (let f = 1; f <= maxFloor; f++) {
     matrix[f] = {};
-    for (const fn of usedFns) {
-      matrix[f][fn] = siteBuildings.filter(
-        (b) => allData[b.path]?.function === fn && b.floors >= f
-      ).length;
+    for (const fnId of allFnIds) {
+      matrix[f][fnId] = siteBuildings.filter(b => {
+        const hasFn = (b.breakdown ?? []).some(fn => fn.functionId === fnId);
+        return hasFn && b.floors >= f;
+      }).length;
     }
   }
 
-  // ── Column totals = sum of floors per function ────────────────────────────
+  // ── Column totals = sum of floors for buildings that have that function ───
   const colTotals = {};
-  for (const fn of usedFns) {
-    colTotals[fn] = siteBuildings
-      .filter((b) => allData[b.path]?.function === fn)
+  for (const fnId of allFnIds) {
+    colTotals[fnId] = siteBuildings
+      .filter(b => (b.breakdown ?? []).some(fn => fn.functionId === fnId))
       .reduce((sum, b) => sum + b.floors, 0);
   }
 
-  // ── Unit total — ONLY bedroom functions count ─────────────────────────────
-  const totalUnits = usedFns
-    .filter((fn) => UNIT_FUNCTIONS.includes(fn))
-    .reduce((sum, fn) => sum + (colTotals[fn] || 0), 0);
+  const unitTotal  = unitFnIds.reduce((s, id) => s + (colTotals[id] || 0), 0);
+  const grandTotal = allFnIds.reduce((s, id) => s + (colTotals[id] || 0), 0);
 
-  // Grand total for percentage calculations (all functions)
-  const grandTotal = Object.values(colTotals).reduce((a, b) => a + b, 0);
-
-  // ── Row totals ─────────────────────────────────────────────────────────────
   const rowTotals = {};
   for (let f = 1; f <= maxFloor; f++) {
-    rowTotals[f] = usedFns.reduce((sum, fn) => sum + (matrix[f][fn] || 0), 0);
+    rowTotals[f] = allFnIds.reduce((s, id) => s + (matrix[f][id] || 0), 0);
   }
 
-  // ── KPI values ─────────────────────────────────────────────────────────────
-  const totalGFA  = siteBuildings.reduce((sum, b) => sum + b.gfaSF, 0);
-  const totalCost = siteBuildings.reduce((sum, b) => {
-    const d = allData[b.path];
-    return sum + (d?.costPerSF ? b.gfaSF * parseFloat(d.costPerSF) : 0);
-  }, 0);
-  const phases = [...new Set(siteBuildings.map((b) => allData[b.path]?.phase).filter(Boolean))];
+  // ── GFA and cost per function across all site buildings ───────────────────
+  const fnGFA = {};
+  const fnCost = {};
+  for (const fnId of allFnIds) {
+    fnGFA[fnId] = 0;
+    fnCost[fnId] = 0;
+    for (const b of siteBuildings) {
+      const fn = (b.breakdown ?? []).find(fn => fn.functionId === fnId);
+      if (!fn) continue;
+      fnGFA[fnId] += fn.gfaSF;
+      const cpsf = parseFloat(allData[b.path]?.functions?.[fnId]?.costPerSF) || 0;
+      fnCost[fnId] += fn.gfaSF * cpsf;
+    }
+  }
+
+  const totalGFA  = Object.values(fnGFA).reduce((a, b) => a + b, 0);
+  const totalCost = Object.values(fnCost).reduce((a, b) => a + b, 0);
+  const phases    = [...new Set(siteBuildings.map(b => allData[b.path]?.phase).filter(Boolean))].sort();
 
   return (
     <div style={S.root}>
@@ -83,10 +117,10 @@ export default function Matrix({ allBuildings, allData }) {
       {/* KPI cards */}
       <div style={S.cards}>
         {[
-          { label: "Buildings",        value: siteBuildings.length },
-          { label: "Residential Units", value: totalUnits },
-          { label: "Total GFA",        value: totalGFA > 0 ? `${(totalGFA / 1000).toFixed(0)}k SF` : "—" },
-          { label: "Est. Cost",        value: totalCost > 0 ? `$${(totalCost / 1e6).toFixed(1)}M` : "—" },
+          { label: "Buildings",    value: siteBuildings.length },
+          { label: "Units",        value: unitTotal },
+          { label: "Total GFA",    value: totalGFA > 0 ? `${(totalGFA/1000).toFixed(0)}k SF` : "—" },
+          { label: "Est. Cost",    value: totalCost > 0 ? `$${(totalCost/1e6).toFixed(1)}M` : "—" },
         ].map(({ label, value }) => (
           <div key={label} style={S.card}>
             <div style={S.cardVal}>{value}</div>
@@ -95,22 +129,19 @@ export default function Matrix({ allBuildings, allData }) {
         ))}
       </div>
 
-      {/* Legend — show unit badge vs support badge */}
+      {/* Legend */}
       <div style={S.legend}>
-        {usedFns.map((fn) => (
-          <div key={fn} style={S.legendItem}>
-            <div style={{
-              width: 7, height: 7, borderRadius: UNIT_FUNCTIONS.includes(fn) ? "50%" : "2px",
-              background: FN_COLOR[fn], flexShrink: 0,
-            }} />
-            <span style={{ color: UNIT_FUNCTIONS.includes(fn) ? "#9CA3AF" : "#6B7280" }}>
-              {FN_SHORT[fn]}
-            </span>
-            {!UNIT_FUNCTIONS.includes(fn) && (
-              <span style={{ fontSize: 8, color: "#4B5563", marginLeft: 1 }}>(support)</span>
-            )}
-          </div>
-        ))}
+        {allFnIds.map(id => {
+          const { functionName: name, functionColor: color } = fnMap[id];
+          const isUnit = isUnitFunction(name);
+          return (
+            <div key={id} style={S.legendItem}>
+              <div style={{ width: 7, height: 7, borderRadius: isUnit ? "50%" : "2px", background: color, flexShrink: 0 }} />
+              <span style={{ color: isUnit ? "#9CA3AF" : "#6B7280" }}>{name}</span>
+              {!isUnit && <span style={{ fontSize: 8, color: "#4B5563" }}>(support)</span>}
+            </div>
+          );
+        })}
       </div>
 
       {/* Matrix table */}
@@ -119,10 +150,15 @@ export default function Matrix({ allBuildings, allData }) {
           <thead>
             <tr>
               <th style={{ ...S.th, textAlign: "left", color: "#4B5563" }}>Fl</th>
-              {usedFns.map((fn) => (
-                <th key={fn} style={S.th}>
-                  <span style={{ color: FN_COLOR[fn], opacity: UNIT_FUNCTIONS.includes(fn) ? 1 : 0.5 }}>
-                    {FN_SHORT[fn]}
+              {allFnIds.map(id => (
+                <th key={id} style={S.th}>
+                  <span style={{
+                    color: fnMap[id].functionColor,
+                    opacity: isUnitFunction(fnMap[id].functionName) ? 1 : 0.5,
+                  }}>
+                    {fnMap[id].functionName.length > 6
+                      ? fnMap[id].functionName.slice(0, 5) + "…"
+                      : fnMap[id].functionName}
                   </span>
                 </th>
               ))}
@@ -130,23 +166,17 @@ export default function Matrix({ allBuildings, allData }) {
             </tr>
           </thead>
           <tbody>
-            {Array.from({ length: maxFloor }, (_, i) => i + 1).map((floor) => (
+            {Array.from({ length: maxFloor }, (_, i) => i + 1).map(floor => (
               <tr key={floor} style={floor % 2 === 0 ? S.rowEven : {}}>
                 <td style={{ ...S.td, color: "#6B7280", fontFamily: "monospace", fontWeight: 600, fontSize: 11 }}>
                   {floor}
                 </td>
-                {usedFns.map((fn) => {
-                  const count = matrix[floor][fn] || 0;
+                {allFnIds.map(id => {
+                  const count = matrix[floor][id] || 0;
                   return (
-                    <td key={fn} style={S.td}>
+                    <td key={id} style={S.td}>
                       {count > 0
-                        ? <span style={{
-                            color: FN_COLOR[fn],
-                            fontWeight: 700,
-                            fontFamily: "monospace",
-                            fontSize: 13,
-                            opacity: UNIT_FUNCTIONS.includes(fn) ? 1 : 0.5,
-                          }}>{count}</span>
+                        ? <span style={{ color: fnMap[id].functionColor, fontWeight: 700, fontFamily: "monospace", fontSize: 13, opacity: isUnitFunction(fnMap[id].functionName) ? 1 : 0.5 }}>{count}</span>
                         : <span style={{ color: "#1F2937" }}>—</span>
                       }
                     </td>
@@ -161,27 +191,22 @@ export default function Matrix({ allBuildings, allData }) {
           <tfoot>
             <tr style={S.totalRow}>
               <td style={{ ...S.tdTotal, textAlign: "left", color: "#9CA3AF" }}>Total</td>
-              {usedFns.map((fn) => (
-                <td key={fn} style={S.tdTotal}>
-                  <div style={{
-                    color: FN_COLOR[fn],
-                    fontWeight: 700,
-                    opacity: UNIT_FUNCTIONS.includes(fn) ? 1 : 0.5,
-                  }}>
-                    {colTotals[fn]}
-                  </div>
-                  {UNIT_FUNCTIONS.includes(fn) && (
-                    <div style={S.pct}>
-                      {totalUnits ? Math.round((colTotals[fn] / totalUnits) * 100) : 0}% of units
+              {allFnIds.map(id => {
+                const isUnit = isUnitFunction(fnMap[id].functionName);
+                return (
+                  <td key={id} style={S.tdTotal}>
+                    <div style={{ color: fnMap[id].functionColor, fontWeight: 700, opacity: isUnit ? 1 : 0.5 }}>
+                      {colTotals[id]}
                     </div>
-                  )}
-                  {!UNIT_FUNCTIONS.includes(fn) && (
-                    <div style={{ ...S.pct, color: "#374151" }}>support</div>
-                  )}
-                </td>
-              ))}
+                    {isUnit
+                      ? <div style={S.pct}>{unitTotal ? Math.round((colTotals[id]/unitTotal)*100) : 0}%</div>
+                      : <div style={{ ...S.pct, color: "#374151" }}>support</div>
+                    }
+                  </td>
+                );
+              })}
               <td style={{ ...S.tdTotal, color: "#E2E8F0" }}>
-                <div style={{ fontWeight: 700 }}>{totalUnits}</div>
+                <div style={{ fontWeight: 700 }}>{unitTotal}</div>
                 <div style={S.pct}>units</div>
               </td>
             </tr>
@@ -189,58 +214,60 @@ export default function Matrix({ allBuildings, allData }) {
         </table>
       </div>
 
-      {/* Per-building breakdown */}
+      {/* GFA + Cost breakdown per function */}
       <div style={S.section}>
-        <div style={S.sectionLabel}>By Building</div>
-        {siteBuildings.map((b) => {
-          const d      = allData[b.path];
-          const fn     = d?.function ?? "—";
-          const color  = FN_COLOR[fn] ?? "#6B7280";
-          const isUnit = UNIT_FUNCTIONS.includes(fn);
-          const units  = b.floors;
-          const pct    = totalUnits && isUnit ? Math.round((units / totalUnits) * 100) : 0;
+        <div style={S.sectionLabel}>GFA & Cost by Function</div>
+        {allFnIds.map(id => {
+          const { functionName: name, functionColor: color } = fnMap[id];
+          const gfa  = fnGFA[id];
+          const cost = fnCost[id];
+          const pct  = totalGFA > 0 ? Math.round((gfa / totalGFA) * 100) : 0;
           return (
-            <div key={b.path} style={S.bldgRow}>
-              <div style={S.bldgHeader}>
-                <span style={{ color, fontWeight: 600, fontSize: 11 }}>
-                  {fn}
-                  {!isUnit && <span style={{ color: "#4B5563", fontWeight: 400, fontSize: 10 }}> (support)</span>}
-                </span>
-                <span style={{ color: "#6B7280", fontSize: 10, fontFamily: "monospace" }}>
-                  {b.floors} fl · {b.gfaSF > 0 ? `${b.gfaSF.toLocaleString()} SF` : "—"}
+            <div key={id} style={S.fnRow}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <div style={{ width: 7, height: 7, borderRadius: "50%", background: color }} />
+                  <span style={{ fontSize: 11, color, fontWeight: 600 }}>{name}</span>
+                </div>
+                <span style={{ fontSize: 10, color: "#6B7280", fontFamily: "monospace" }}>
+                  {gfa.toLocaleString()} SF · {pct}%
+                  {cost > 0 && <span style={{ color: "#34D399", marginLeft: 6 }}>${Math.round(cost).toLocaleString()}</span>}
                 </span>
               </div>
-              {isUnit && (
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <div style={S.track}>
-                    <div style={{ ...S.bar, width: `${pct}%`, background: color }} />
-                  </div>
-                  <span style={S.bldgCount}>{units} units · {pct}%</span>
-                </div>
-              )}
+              <div style={{ height: 3, background: "rgba(255,255,255,0.05)", borderRadius: 2 }}>
+                <div style={{ height: "100%", width: `${pct}%`, background: color, borderRadius: 2, opacity: 0.6 }} />
+              </div>
             </div>
           );
         })}
+        {totalCost > 0 && (
+          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, paddingTop: 10, borderTop: "1px solid rgba(255,255,255,0.07)" }}>
+            <span style={{ fontSize: 11, color: "#9CA3AF" }}>Total Cost</span>
+            <span style={{ fontSize: 13, fontWeight: 700, color: "#34D399", fontFamily: "monospace" }}>
+              ${Math.round(totalCost).toLocaleString()}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Phase breakdown */}
       {phases.length > 0 && (
         <div style={S.section}>
           <div style={S.sectionLabel}>By Phase</div>
-          {phases.sort().map((phase) => {
-            const pBuildings = siteBuildings.filter((b) => allData[b.path]?.phase === phase);
-            // Only count unit-type buildings in phase totals
-            const pUnits = pBuildings
-              .filter((b) => UNIT_FUNCTIONS.includes(allData[b.path]?.function))
+          {phases.map(phase => {
+            const pBldgs = siteBuildings.filter(b => allData[b.path]?.phase === phase);
+            const pUnits = pBldgs
+              .filter(b => (b.breakdown ?? []).some(fn => isUnitFunction(fn.functionName)))
               .reduce((s, b) => s + b.floors, 0);
-            const pPct = totalUnits ? Math.round((pUnits / totalUnits) * 100) : 0;
+            const pGFA   = pBldgs.reduce((s, b) => s + b.gfaSF, 0);
+            const pPct   = unitTotal ? Math.round((pUnits / unitTotal) * 100) : 0;
             return (
               <div key={phase} style={S.phaseRow}>
                 <span style={S.phaseLabel}>{phase}</span>
                 <div style={S.track}>
                   <div style={{ ...S.bar, width: `${pPct}%` }} />
                 </div>
-                <span style={S.bldgCount}>{pUnits} units · {pPct}%</span>
+                <span style={S.phaseCount}>{pUnits} units · {pGFA > 0 ? `${(pGFA/1000).toFixed(0)}k SF` : "—"}</span>
               </div>
             );
           })}
@@ -251,32 +278,31 @@ export default function Matrix({ allBuildings, allData }) {
 }
 
 const S = {
-  root:        { display: "flex", flexDirection: "column", padding: "10px 0 24px" },
-  empty:       { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "60px 24px", gap: 10, textAlign: "center" },
-  emptyIcon:   { fontSize: 32, opacity: 0.15 },
-  emptyTitle:  { fontSize: 14, fontWeight: 700, color: "#E2E8F0", opacity: 0.3 },
-  emptyNote:   { fontSize: 12, color: "#4B5563", lineHeight: 1.6 },
-  cards:       { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6, padding: "0 12px 10px" },
-  card:        { background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 7, padding: "8px 6px", textAlign: "center" },
-  cardVal:     { fontSize: 15, fontWeight: 700, color: "#E2E8F0", fontFamily: "monospace" },
-  cardLabel:   { fontSize: 9, letterSpacing: "0.07em", textTransform: "uppercase", color: "#6B7280", marginTop: 2 },
-  legend:      { display: "flex", gap: 10, padding: "0 12px 10px", flexWrap: "wrap" },
-  legendItem:  { display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#9CA3AF" },
-  tableWrap:   { overflowX: "auto", padding: "0 12px" },
-  table:       { width: "100%", borderCollapse: "collapse", fontSize: 12 },
-  th:          { padding: "7px 6px", textAlign: "center", fontSize: 10, letterSpacing: "0.06em", color: "#6B7280", fontFamily: "monospace", borderBottom: "1px solid rgba(255,255,255,0.08)", fontWeight: 600 },
-  td:          { padding: "6px 6px", textAlign: "center", borderBottom: "1px solid rgba(255,255,255,0.04)" },
-  rowEven:     { background: "rgba(255,255,255,0.015)" },
-  totalRow:    { background: "rgba(0,0,0,0.3)", borderTop: "1px solid rgba(255,255,255,0.1)" },
-  tdTotal:     { padding: "8px 6px", textAlign: "center", fontSize: 12, fontFamily: "monospace" },
-  pct:         { fontSize: 9, color: "#6B7280", marginTop: 2 },
-  section:     { padding: "14px 12px 0" },
-  sectionLabel:{ fontSize: 9, letterSpacing: "0.09em", textTransform: "uppercase", color: "#4B5563", fontFamily: "monospace", marginBottom: 10 },
-  bldgRow:     { marginBottom: 10, paddingBottom: 10, borderBottom: "1px solid rgba(255,255,255,0.04)" },
-  bldgHeader:  { display: "flex", justifyContent: "space-between", marginBottom: 4 },
-  phaseRow:    { display: "flex", alignItems: "center", gap: 8, marginBottom: 8 },
-  phaseLabel:  { fontSize: 11, color: "#FBBF24", fontFamily: "monospace", width: 54, flexShrink: 0 },
-  track:       { flex: 1, height: 4, background: "rgba(255,255,255,0.06)", borderRadius: 2 },
-  bar:         { height: "100%", background: "#FBBF24", borderRadius: 2, opacity: 0.7, transition: "width 0.4s" },
-  bldgCount:   { fontSize: 10, color: "#6B7280", whiteSpace: "nowrap", width: 80, textAlign: "right" },
+  root:         { display: "flex", flexDirection: "column", paddingBottom: 24 },
+  empty:        { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "60px 24px", gap: 10, textAlign: "center" },
+  emptyIcon:    { fontSize: 32, opacity: 0.15 },
+  emptyTitle:   { fontSize: 14, fontWeight: 700, color: "#E2E8F0", opacity: 0.3 },
+  emptyNote:    { fontSize: 12, color: "#4B5563", lineHeight: 1.6 },
+  cards:        { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6, padding: "12px 12px 0" },
+  card:         { background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 7, padding: "8px 6px", textAlign: "center" },
+  cardVal:      { fontSize: 15, fontWeight: 700, color: "#E2E8F0", fontFamily: "monospace" },
+  cardLabel:    { fontSize: 9, letterSpacing: "0.07em", textTransform: "uppercase", color: "#6B7280", marginTop: 2 },
+  legend:       { display: "flex", gap: 8, padding: "10px 12px 0", flexWrap: "wrap" },
+  legendItem:   { display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#9CA3AF" },
+  tableWrap:    { overflowX: "auto", padding: "10px 12px 0" },
+  table:        { width: "100%", borderCollapse: "collapse", fontSize: 12 },
+  th:           { padding: "7px 6px", textAlign: "center", fontSize: 10, letterSpacing: "0.06em", color: "#6B7280", fontFamily: "monospace", borderBottom: "1px solid rgba(255,255,255,0.08)", fontWeight: 600 },
+  td:           { padding: "6px 6px", textAlign: "center", borderBottom: "1px solid rgba(255,255,255,0.04)" },
+  rowEven:      { background: "rgba(255,255,255,0.015)" },
+  totalRow:     { background: "rgba(0,0,0,0.3)", borderTop: "1px solid rgba(255,255,255,0.1)" },
+  tdTotal:      { padding: "8px 6px", textAlign: "center", fontSize: 12, fontFamily: "monospace" },
+  pct:          { fontSize: 9, color: "#6B7280", marginTop: 2 },
+  section:      { padding: "14px 12px 0" },
+  sectionLabel: { fontSize: 9, letterSpacing: "0.09em", textTransform: "uppercase", color: "#4B5563", fontFamily: "monospace", marginBottom: 10 },
+  fnRow:        { marginBottom: 10 },
+  phaseRow:     { display: "flex", alignItems: "center", gap: 8, marginBottom: 8 },
+  phaseLabel:   { fontSize: 11, color: "#FBBF24", fontFamily: "monospace", width: 54, flexShrink: 0 },
+  track:        { flex: 1, height: 4, background: "rgba(255,255,255,0.06)", borderRadius: 2 },
+  bar:          { height: "100%", background: "#FBBF24", borderRadius: 2, opacity: 0.7 },
+  phaseCount:   { fontSize: 10, color: "#6B7280", whiteSpace: "nowrap", width: 100, textAlign: "right" },
 };
